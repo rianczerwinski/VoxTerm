@@ -44,6 +44,7 @@ class SystemCapture:
     def start(self) -> None:
         if self._active:
             return
+        self._died_during_recording = False  # reset from previous session
         if CURRENT_PLATFORM != Platform.MACOS:
             self._unavailable = True
             self._status_message = "system audio capture not supported on this platform"

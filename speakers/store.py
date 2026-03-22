@@ -150,7 +150,7 @@ class SpeakerStore:
     def _safe_commit(self) -> bool:
         """S1: commit with rollback on failure (e.g. disk full)."""
         try:
-            self._safe_commit()
+            self._conn.commit()
             return True
         except sqlite3.OperationalError:
             try:

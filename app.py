@@ -688,6 +688,10 @@ class VoxTerm(App):
             # _mlx_lock serializes all Metal GPU access — prevents concurrent
             # command buffer submission from transcription + model loading.
             with _mlx_lock:
+                # Reset timer to when Metal work actually starts (not when queued).
+                # Prevents watchdog from cancelling a transcription that was just
+                # waiting behind a model swap for the lock.
+                self._transcribe_started = time.time()
                 result = self.transcriber.transcribe(audio)
 
             # Free Metal memory after each transcription (G3 — VRAM exhaustion)
