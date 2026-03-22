@@ -88,3 +88,41 @@ P2P_MAX_PEERS = 20
 P2P_AUDIO_FRAME_MS = 20            # milliseconds per UDP audio frame
 P2P_CLOCK_SYNC_WINDOW = 20         # sliding window of offset samples
 P2P_SERVICE_TYPE = "_voxterm._tcp.local."
+
+# ── spatial audio processing ──────────────────────────────────────────
+
+# STFT parameters
+SPATIAL_FFT_SIZE = 1024
+SPATIAL_HOP_SIZE = 256           # 16ms at 16kHz
+SPATIAL_FREQ_MIN = 300           # Hz — below this, distributed phones can't resolve spatially
+SPATIAL_FREQ_MAX = 8000          # Hz — upper bound for spatial processing
+
+# Device requirements
+SPATIAL_MIN_DEVICES = 4          # minimum for full spatial processing
+SPATIAL_DEGRADED_DEVICES = 3     # DOA hints only at this count
+
+# SRP-PHAT grid resolution
+SPATIAL_SRP_COARSE_DEG = 30      # coarse scan (degrees)
+SPATIAL_SRP_FINE_DEG = 5         # fine refinement (degrees)
+
+# Calibration
+SPATIAL_CHIRP_FREQ_START = 200   # Hz
+SPATIAL_CHIRP_FREQ_END = 8000    # Hz
+SPATIAL_CHIRP_DURATION = 0.5     # seconds
+SPATIAL_CHIRP_REPETITIONS = 3
+SPATIAL_RECALIBRATION_DRIFT = 3.0  # TDOA change multiplier → recalibrate prompt
+
+# Beamforming
+SPATIAL_MVDR_REGULARIZATION = 1e-6  # diagonal loading for covariance inversion
+SPATIAL_WPE_TAPS = 10            # nara_wpe prediction filter length
+SPATIAL_WPE_DELAY = 3            # nara_wpe prediction delay
+
+# Retention
+SPATIAL_RAW_RETENTION_HOURS = 168      # 7 days — raw multichannel (sensitive tier)
+SPATIAL_ENHANCED_RETENTION_HOURS = 720  # 30 days — enhanced mono (standard tier)
+SPATIAL_METADATA_RETENTION_HOURS = 8760  # 1 year — diarization/identity metadata
+
+# Dual-path fusion
+SPATIAL_FUSION_SPATIAL_WEIGHT = 0.5
+SPATIAL_FUSION_EMBEDDING_WEIGHT = 0.5
+SPATIAL_DOMINANCE_THRESHOLD = 0.8  # confidence above this → that path dominates

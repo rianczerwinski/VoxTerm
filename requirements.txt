@@ -7,3 +7,5 @@ silero-vad>=5.1
 onnxruntime>=1.16.0
 zeroconf>=0.131.0
 cryptography>=42.0.0
+pyroomacoustics>=0.7.0
+nara_wpe>=0.0.9
