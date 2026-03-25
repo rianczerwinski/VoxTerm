@@ -239,9 +239,8 @@ class QuitConfirmScreen(ModalScreen):
         align: center middle;
     }
     #quit-dialog {
-        width: 50;
-        height: auto;
-        max-height: 10;
+        width: 52;
+        height: 12;
         border: heavy #ff6600;
         border-title-color: #ffaa00;
         border-title-style: bold;
@@ -249,8 +248,7 @@ class QuitConfirmScreen(ModalScreen):
         padding: 1 2;
     }
     #quit-list {
-        height: auto;
-        max-height: 4;
+        height: 4;
         background: #0a0e14;
         color: #c0c0c0;
     }
@@ -262,25 +260,30 @@ class QuitConfirmScreen(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("q", "confirm_quit", "Quit"),
     ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="quit-dialog") as dialog:
             dialog.border_title = "QUIT?"
             yield Static(
-                "[#ffaa00]Recording is active.[/] Your transcript is auto-saved,\n"
-                "but the current segment will be lost.",
+                "[#ffaa00]Recording is active.[/]\n"
+                "Transcript is auto-saved. Current segment will be lost.",
                 markup=True,
             )
             yield Static("")
             yield OptionList(
                 Option("  Quit anyway", id="quit"),
-                Option("  Cancel — keep recording", id="cancel"),
+                Option("  Cancel", id="cancel"),
                 id="quit-list",
             )
+            yield Static("[dim]Q to quit  ·  ESC to cancel[/]", markup=True)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option.id == "quit")
+
+    def action_confirm_quit(self) -> None:
+        self.dismiss(True)
 
     def action_cancel(self) -> None:
         self.dismiss(False)
