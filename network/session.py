@@ -479,6 +479,8 @@ class SessionManager:
             while self._running and peer.state == "connected":
                 try:
                     msg = recv_plaintext_msg(peer.sock)
+                except socket.timeout:
+                    continue  # no data yet — heartbeat timeout handles stale peers
                 except Exception:
                     msg = None
 

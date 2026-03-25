@@ -1585,6 +1585,11 @@ class VoxTerm(App):
                 )
                 for pi in visible:
                     if pi.in_session and pi.node_id != my_id:
+                        # Only retry peers the tie-break prevented us from
+                        # connecting to (my_id >= their id). We already tried
+                        # the other direction — this handles one-way mDNS.
+                        if my_id < pi.node_id:
+                            continue  # we already attempted this side
                         with mgr._lock:
                             if pi.node_id in mgr._peers:
                                 continue
@@ -1612,8 +1617,9 @@ class VoxTerm(App):
             except Exception:
                 pass
             self._session_mgr = None
+            self._p2p_send_queue = None
             self.call_from_thread(
-                self.query_one(TranscriptPanel).system_message,
+                self._p2p_system_msg,
                 f"P2P session failed: {exc}",
             )
 
@@ -1680,17 +1686,11 @@ class VoxTerm(App):
         mgr = self._session_mgr
 
         def on_connected(peer):
-            self.call_from_thread(
-                self.query_one(TranscriptPanel).system_message,
-                f"{peer.display_name} connected"
-            )
+            self.call_from_thread(self._p2p_system_msg, f"{peer.display_name} connected")
             self.call_from_thread(self._update_telemetry)
 
         def on_disconnected(node_id, display_name):
-            self.call_from_thread(
-                self.query_one(TranscriptPanel).system_message,
-                f"{display_name} disconnected"
-            )
+            self.call_from_thread(self._p2p_system_msg, f"{display_name} disconnected")
             if self._assembler:
                 self._assembler.clear_peer(node_id)
             self.call_from_thread(self._update_telemetry)
@@ -1738,6 +1738,10 @@ class VoxTerm(App):
             confidence="",
         )
         self._append_live_transcript(text, f"{peer_display_name}:{speaker}", 0)
+
+    def _p2p_system_msg(self, text: str) -> None:
+        """Show a P2P system message. Must be called on main thread."""
+        self.query_one(TranscriptPanel).system_message(text)
 
     def action_show_help(self):
         self.push_screen(HelpScreen())
