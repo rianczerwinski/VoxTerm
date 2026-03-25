@@ -1,11 +1,13 @@
 Screen {
     background: #0a0e14;
     overflow: hidden;
+    layers: base notifications;
 }
 
 #main-container {
     width: 1fr;
     height: 1fr;
+    layer: base;
 }
 
 #footer-bar {

@@ -66,10 +66,9 @@ from config import (
 try:
     from network.session import SessionManager
     from network.segments import TranscriptAssembler
-    from network.crypto import generate_session_code, derive_session_key
     from network.debug import P2PDebugStats
     from network.discovery import PeerDiscovery
-    from widgets.peer_browser import SessionCreateScreen, SessionJoinScreen
+    from widgets.room_invite import RoomInviteToast
     _P2P_AVAILABLE = True
 except ImportError:
     _P2P_AVAILABLE = False
@@ -333,8 +332,7 @@ class HelpScreen(ModalScreen):
                 "[bold #00e5ff]S[/]       [#c0c0c0]Save / copy transcript[/]\n"
                 "[bold #00e5ff]M[/]       [#c0c0c0]Switch transcription model[/]\n"
                 "[bold #00e5ff]L[/]       [#c0c0c0]Switch language[/]\n"
-                "[bold #00e5ff]N[/]       [#c0c0c0]New P2P session (multi-device)[/]\n"
-                "[bold #00e5ff]J[/]       [#c0c0c0]Join P2P session by code[/]\n"
+                "[bold #00e5ff]N[/]       [#c0c0c0]Go live (share with nearby peers)[/]\n"
                 "[bold #00e5ff]C[/]       [#c0c0c0]Clear transcript[/]\n"
                 "[bold #00e5ff]D[/]       [#c0c0c0]Toggle debug mode[/]\n"
                 "[bold #00e5ff]Q[/]       [#c0c0c0]Quit[/]",
@@ -424,18 +422,13 @@ class VoxTerm(App):
         Binding("s", "export_transcript", "Export"),
         Binding("d", "toggle_debug", "Debug"),
         Binding("c", "clear_transcript", "Clear"),
-        Binding("n", "new_session", "Session"),
-        Binding("j", "join_session", "Join"),
+        Binding("n", "go_live", "Go Live"),
         Binding("?", "show_help", "Help", key_display="?"),
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, transcriber=None, model_name="qwen3-0.6b", language="en",
-                 p2p_name=None, p2p_create=False, p2p_join_code=None):
+    def __init__(self, transcriber=None, model_name="qwen3-0.6b", language="en"):
         super().__init__()
-        self._p2p_auto_name = p2p_name
-        self._p2p_auto_create = p2p_create
-        self._p2p_auto_join_code = p2p_join_code
         self.audio_capture = AudioCapture()
         self.system_capture = SystemCapture()
         self.audio_buffer = AudioBuffer()
@@ -472,12 +465,14 @@ class VoxTerm(App):
         # P2P networking state
         self._session_mgr: SessionManager | None = None
         self._discovery: PeerDiscovery | None = None
-        self._p2p_display_name: str = ""
+        self._p2p_display_name: str = _get_config().get("p2p_display_name") or os.getlogin()
         self._p2p_node_id: str = ""
         self._transcript_seq: int = 0
         self._assembler = TranscriptAssembler() if _P2P_AVAILABLE else None
         self._p2p_debug = P2PDebugStats() if _P2P_AVAILABLE else None
         self._p2p_send_queue: queue.Queue | None = None
+        self._active_invite: object | None = None  # RoomInviteToast when shown
+        self._peer_first_transcript: set = set()  # node_ids that sent first line
 
     def compose(self) -> ComposeResult:
         yield CyberHeader()
@@ -493,7 +488,7 @@ class VoxTerm(App):
             " [bold #00e5ff]\\[R][/][#607080] Record  [/]"
             "[bold #00e5ff]\\[T][/][#607080] Tag  [/]"
             "[bold #00e5ff]\\[P][/][#607080] Profiles  [/]"
-            "[bold #00e5ff]\\[N][/][#607080] Session  [/]"
+            "[bold #00e5ff]\\[N][/][#607080] Live  [/]"
             "[bold #00e5ff]\\[?][/][#607080] Help[/]",
             id="footer-bar",
             markup=True,
@@ -564,13 +559,20 @@ class VoxTerm(App):
         # P2P indicator
         p2p_text = ""
         if self._session_mgr and self._session_mgr.is_in_session:
-            pc = self._session_mgr.peer_count
-            code = self._session_mgr.session_code or ""
-            p2p_text = f"    [#00e5ff]P2P {code} ({pc} peer{'s' if pc != 1 else ''})[/]"
+            peers = self._session_mgr.peers
+            if peers:
+                peer_parts = []
+                for p in peers.values():
+                    lat = f" {p.clock.rtt*1000:.0f}ms" if p.clock.sample_count > 0 else ""
+                    peer_parts.append(f"[#00ffcc]●[/] {p.display_name}{lat}")
+                p2p_text = f"    [#00e5ff]LIVE[/]  " + "  ".join(peer_parts)
+            else:
+                p2p_text = f"    [#00e5ff]LIVE[/] [dim]waiting for peers...[/]"
         elif self._discovery:
-            visible = len(self._discovery.get_visible_peers())
-            if visible > 0:
-                p2p_text = f"    [#00e5ff]{visible} peer{'s' if visible != 1 else ''} on network[/]"
+            visible = [p for p in self._discovery.get_visible_peers()
+                       if p.node_id != self._p2p_node_id]
+            if visible:
+                p2p_text = f"    [dim]{len(visible)} peer{'s' if len(visible) != 1 else ''} nearby[/]"
 
         self.query_one("#telemetry", Static).update(
             f"  {status}"
@@ -1443,10 +1445,14 @@ class VoxTerm(App):
     # ── P2P session actions ─────────────────────────────────────
 
     def _ensure_p2p_identity(self) -> None:
-        """Generate a stable node_id for this session (once per app run)."""
+        """Generate a stable node_id and persist display name (once per app run)."""
         if not self._p2p_node_id:
             import uuid
             self._p2p_node_id = str(uuid.uuid4()).replace("-", "")[:16]
+        # Save display name to config if not already saved
+        cfg = _get_config()
+        if not cfg.get("p2p_display_name"):
+            cfg.set("p2p_display_name", self._p2p_display_name)
 
     def _start_discovery(self, tcp_port: int) -> None:
         """Start mDNS discovery with the actual TCP port."""
@@ -1474,17 +1480,14 @@ class VoxTerm(App):
             )
 
             def on_found(peer_info):
-                self.call_from_thread(
-                    self._p2p_debug_msg,
-                    f"peer online: {peer_info.display_name} ({peer_info.ip})"
-                )
+                if peer_info.node_id == self._p2p_node_id:
+                    return
                 self.call_from_thread(self._update_telemetry)
+                # If the peer is live, show a toast
+                if peer_info.in_session:
+                    self.call_from_thread(self._show_peer_toast, peer_info)
 
             def on_lost(node_id):
-                self.call_from_thread(
-                    self._p2p_debug_msg,
-                    f"peer offline: {node_id[:8]}"
-                )
                 self.call_from_thread(self._update_telemetry)
 
             self._discovery.on_peer_found = on_found
@@ -1507,40 +1510,25 @@ class VoxTerm(App):
             self._discovery.stop()
             self._discovery = None
 
-    def action_new_session(self):
+    def action_go_live(self):
+        """Press N — go live on the network so peers can see and connect to you."""
         if not _P2P_AVAILABLE:
             self.query_one(TranscriptPanel).system_message(
                 "P2P unavailable — install zeroconf and cryptography"
             )
             return
         if self._session_mgr and self._session_mgr.is_in_session:
-            self.query_one(TranscriptPanel).system_message("already in a session")
+            self.query_one(TranscriptPanel).system_message("already live")
             return
-        code = generate_session_code()
-        self.push_screen(SessionCreateScreen(code), self._on_session_create_result)
-
-    def _on_session_create_result(self, result: dict | None) -> None:
-        if result is None:
-            return
-        name = result["display_name"]
-        code = result["session_code"]
-        self._p2p_display_name = name
         self._ensure_p2p_identity()
-        # Cancel the auto-discovery worker BEFORE stopping discovery —
-        # prevents the worker from overwriting self._discovery after we nil it.
         self.workers.cancel_group(self, "p2p_discovery")
-        self._stop_discovery()  # stop auto-discovery before session setup
-
-        tp = self.query_one(TranscriptPanel)
-        tp.system_message(f"P2P session starting...")
-        self._start_p2p_session(code, is_creator=True)
+        self._stop_discovery()
+        self._go_live()
 
     @work(thread=True, group="p2p_setup")
-    def _start_p2p_session(self, code: str, is_creator: bool) -> None:
-        """Start P2P session in a worker thread to avoid blocking the event loop."""
+    def _go_live(self) -> None:
+        """Go live — start server, advertise via mDNS, auto-connect to peers."""
         try:
-            # Shut down any previous session manager that may be orphaned
-            # from a cancelled worker (thread=True workers can't be interrupted)
             old_mgr = self._session_mgr
             if old_mgr is not None:
                 try:
@@ -1554,14 +1542,13 @@ class VoxTerm(App):
             self._session_mgr = mgr
             self._wire_session_callbacks()
 
-            # Set session code and start server (plaintext for now, no key needed)
-            mgr._session_code = code
-            mgr._session_key = b"unused"  # encryption disabled for debugging
+            mgr._session_code = "live"
+            mgr._session_key = b"unused"
             mgr._start_server()
             mgr._in_session = True
             port = mgr._server_sock.getsockname()[1]
 
-            # Start bounded sender thread for P2P broadcast (replaces per-call threads)
+            # Bounded sender thread
             self._p2p_send_queue = queue.Queue(maxsize=64)
             send_q = self._p2p_send_queue
 
@@ -1576,15 +1563,9 @@ class VoxTerm(App):
                     except Exception:
                         pass
 
-            threading.Thread(
-                target=_p2p_sender_loop, daemon=True, name="p2p-sender"
-            ).start()
+            threading.Thread(target=_p2p_sender_loop, daemon=True, name="p2p-sender").start()
 
-            # Wire discovery callback BEFORE starting so we don't miss peers.
-            # Only the node with the lower node_id initiates the TCP connection.
-            # The other side accepts via the accept loop. This prevents the
-            # dual-connect race where both sides connect simultaneously,
-            # clobber each other, and immediately disconnect.
+            # Auto-connect to any live peer found via mDNS
             my_id = self._p2p_node_id
 
             def on_peer_found(peer_info):
@@ -1594,16 +1575,7 @@ class VoxTerm(App):
                     if peer_info.node_id in mgr._peers:
                         return
                 if not peer_info.in_session:
-                    self.call_from_thread(
-                        self._p2p_debug_msg,
-                        f"found {peer_info.display_name} (idle, not in session)"
-                    )
                     return
-                self.call_from_thread(
-                    self._p2p_debug_msg,
-                    f"found {peer_info.display_name} in session — "
-                    + ("connecting..." if my_id < peer_info.node_id else "waiting for their connection...")
-                )
                 # Tie-break: lower node_id initiates
                 if my_id < peer_info.node_id:
                     threading.Thread(
@@ -1616,62 +1588,34 @@ class VoxTerm(App):
             self._discovery.on_peer_found = on_peer_found
             self._discovery.update_session_status(True)
 
-            # Connect to any already-visible peers (same tie-break)
-            for peer_info in self._discovery.get_visible_peers():
-                if (peer_info.in_session
-                        and peer_info.node_id != my_id
-                        and my_id < peer_info.node_id):
+            # Connect to already-visible live peers
+            for pi in self._discovery.get_visible_peers():
+                if pi.in_session and pi.node_id != my_id and my_id < pi.node_id:
                     threading.Thread(
-                        target=self._try_connect_peer,
-                        args=(peer_info,),
-                        daemon=True,
+                        target=self._try_connect_peer, args=(pi,), daemon=True
                     ).start()
 
-            # Fallback: if no peers connect within 3 seconds, try connecting
-            # to all visible peers regardless of tie-break (in case mDNS
-            # discovery was one-directional)
-            def _retry_connect():
+            # 3s fallback for one-directional mDNS
+            def _retry():
                 import time as _time
                 _time.sleep(3.0)
                 if not mgr._running:
                     return
                 with mgr._lock:
-                    has_peers = bool(mgr._peers)
-                if has_peers:
-                    return
-                visible = self._discovery.get_visible_peers() if self._discovery else []
-                self.call_from_thread(
-                    self._p2p_debug_msg,
-                    f"no peers after 3s, retrying... ({len(visible)} visible on network)"
-                )
-                for pi in visible:
-                    if pi.in_session and pi.node_id != my_id:
-                        # Only retry peers the tie-break prevented us from
-                        # connecting to (my_id >= their id). We already tried
-                        # the other direction — this handles one-way mDNS.
-                        if my_id < pi.node_id:
-                            continue  # we already attempted this side
+                    if mgr._peers:
+                        return
+                for pi in (self._discovery.get_visible_peers() if self._discovery else []):
+                    if pi.in_session and pi.node_id != my_id and my_id >= pi.node_id:
                         with mgr._lock:
                             if pi.node_id in mgr._peers:
                                 continue
                         self._try_connect_peer(pi)
 
-            threading.Thread(target=_retry_connect, daemon=True).start()
+            threading.Thread(target=_retry, daemon=True).start()
 
-            if is_creator:
-                self.call_from_thread(
-                    self._p2p_session_ready,
-                    f"code: {code}  — tell others to press J and enter this",
-                )
-            else:
-                self.call_from_thread(
-                    self._p2p_session_ready,
-                    f"joining session: {code} — scanning network...",
-                )
+            self.call_from_thread(self._on_go_live_ready)
 
         except Exception as exc:
-            # Clean up the half-initialized session manager so the user
-            # isn't stuck in "already in a session" state forever.
             try:
                 if self._session_mgr is not None:
                     self._session_mgr.leave_session()
@@ -1679,44 +1623,135 @@ class VoxTerm(App):
                 pass
             self._session_mgr = None
             self._p2p_send_queue = None
-            self.call_from_thread(
-                self._p2p_system_msg,
-                f"P2P session failed: {exc}",
-            )
+            self.call_from_thread(self._p2p_system_msg, f"P2P failed: {exc}")
 
-    def _p2p_session_ready(self, status_msg: str) -> None:
-        """Called on main thread when P2P session is ready."""
-        tp = self.query_one(TranscriptPanel)
-        tp.system_message("P2P session active")
-        tp.system_message(status_msg)
+    def _on_go_live_ready(self) -> None:
+        """Called on main thread when live mode is ready."""
         self._update_telemetry()
 
-    def action_join_session(self):
-        if not _P2P_AVAILABLE:
-            self.query_one(TranscriptPanel).system_message(
-                "P2P unavailable — install zeroconf and cryptography"
-            )
-            return
+    # ── toast flow (triggered by auto-discovery) ──────────────
+
+    def _show_peer_toast(self, peer_info) -> None:
+        """Show a non-blocking toast when a live peer is found. Main thread."""
+        if self._active_invite is not None:
+            return  # one at a time
         if self._session_mgr and self._session_mgr.is_in_session:
-            self.query_one(TranscriptPanel).system_message("already in a session")
-            return
-        self.push_screen(SessionJoinScreen(), self._on_session_join_result)
+            return  # already connected
+        toast = RoomInviteToast(
+            peer_name=peer_info.display_name,
+            peer_node_id=peer_info.node_id,
+            peer_ip=peer_info.ip,
+            peer_port=peer_info.tcp_port,
+        )
+        self._active_invite = toast
+        self.mount(toast)
 
-    def _on_session_join_result(self, result: dict | None) -> None:
-        if result is None:
-            return
-        name = result["display_name"]
-        code = result["session_code"]
-        self._p2p_display_name = name
+    def on_key(self, event) -> None:
+        """Global key handler — ENTER accepts toast, ESC dismisses."""
+        if self._active_invite is not None:
+            if event.key == "enter":
+                self._active_invite.accept()
+                self._active_invite = None
+                event.prevent_default()
+                event.stop()
+            elif event.key == "escape":
+                self._active_invite.dismiss_toast()
+                self._active_invite = None
+                event.prevent_default()
+                event.stop()
+
+    def on_room_invite_toast_accepted(self, event: RoomInviteToast.Accepted) -> None:
+        """User pressed ENTER on the toast — connect to the peer."""
+        self._active_invite = None
         self._ensure_p2p_identity()
-        # Cancel the auto-discovery worker BEFORE stopping discovery —
-        # prevents the worker from overwriting self._discovery after we nil it.
         self.workers.cancel_group(self, "p2p_discovery")
-        self._stop_discovery()  # stop auto-discovery before session setup
+        self._stop_discovery()
+        self._connect_to_peer_and_go_live(
+            event.peer_ip, event.peer_port, event.peer_name
+        )
 
-        tp = self.query_one(TranscriptPanel)
-        tp.system_message(f"joining session...")
-        self._start_p2p_session(code, is_creator=False)
+    def on_room_invite_toast_dismissed(self, event: RoomInviteToast.Dismissed) -> None:
+        self._active_invite = None
+
+    @work(thread=True, group="p2p_setup")
+    def _connect_to_peer_and_go_live(self, ip: str, port: int, peer_name: str) -> None:
+        """Connect to a specific peer and go live."""
+        try:
+            old_mgr = self._session_mgr
+            if old_mgr is not None:
+                try:
+                    old_mgr.leave_session()
+                except Exception:
+                    pass
+
+            mgr = SessionManager(
+                self._p2p_display_name, node_id=self._p2p_node_id, tcp_port=0,
+            )
+            self._session_mgr = mgr
+            self._wire_session_callbacks()
+
+            mgr._session_code = "live"
+            mgr._session_key = b"unused"
+            mgr._start_server()
+            mgr._in_session = True
+            srv_port = mgr._server_sock.getsockname()[1]
+
+            # Bounded sender thread
+            self._p2p_send_queue = queue.Queue(maxsize=64)
+            send_q = self._p2p_send_queue
+
+            def _sender():
+                while mgr._running:
+                    try:
+                        kwargs = send_q.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    try:
+                        mgr.broadcast_final(**kwargs)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_sender, daemon=True, name="p2p-sender").start()
+
+            # Connect to the peer that invited us
+            success = mgr.join_by_ip(ip, port, "live")
+            if not success:
+                self.call_from_thread(
+                    self._p2p_system_msg,
+                    f"could not connect to {peer_name}"
+                )
+
+            # Also start discovery to find more peers
+            my_id = self._p2p_node_id
+
+            def on_found(pi):
+                if pi.node_id == my_id:
+                    return
+                with mgr._lock:
+                    if pi.node_id in mgr._peers:
+                        return
+                if pi.in_session and my_id < pi.node_id:
+                    threading.Thread(
+                        target=self._try_connect_peer, args=(pi,), daemon=True
+                    ).start()
+
+            self._start_discovery(srv_port)
+            self._discovery.on_peer_found = on_found
+            self._discovery.update_session_status(True)
+
+            self.call_from_thread(self._update_telemetry)
+
+        except Exception as exc:
+            try:
+                if self._session_mgr is not None:
+                    self._session_mgr.leave_session()
+            except Exception:
+                pass
+            self._session_mgr = None
+            self._p2p_send_queue = None
+            self.call_from_thread(self._p2p_system_msg, f"P2P failed: {exc}")
+
+    # ── peer connection + callbacks ───────────────────────────
 
     def _try_connect_peer(self, peer_info) -> None:
         """Try connecting to a discovered peer (runs in background thread)."""
@@ -1724,34 +1759,21 @@ class VoxTerm(App):
         if not mgr or not mgr.is_in_session:
             return
         try:
-            success = mgr.join_by_ip(
-                peer_info.ip, peer_info.tcp_port,
-                mgr.session_code,
-            )
-            if not success:
-                self.call_from_thread(
-                    self._p2p_debug_msg,
-                    f"connection to {peer_info.display_name} failed (wrong session or unreachable)"
-                )
-        except Exception as exc:
-            self.call_from_thread(
-                self._p2p_debug_msg,
-                f"connection error: {exc}"
-            )
+            mgr.join_by_ip(peer_info.ip, peer_info.tcp_port, "live")
+        except Exception:
+            pass
 
     def _p2p_debug_msg(self, text: str) -> None:
-        """Show a P2P debug message in the transcript."""
+        """Show a P2P debug message in the transcript. Must be on main thread."""
         self.query_one(TranscriptPanel).system_message(f"[P2P] {text}")
 
     def _wire_session_callbacks(self) -> None:
         mgr = self._session_mgr
 
         def on_connected(peer):
-            self.call_from_thread(self._p2p_system_msg, f"{peer.display_name} connected")
             self.call_from_thread(self._update_telemetry)
 
         def on_disconnected(node_id, display_name):
-            self.call_from_thread(self._p2p_system_msg, f"{display_name} disconnected")
             if self._assembler:
                 self._assembler.clear_peer(node_id)
             self.call_from_thread(self._update_telemetry)
@@ -1768,12 +1790,12 @@ class VoxTerm(App):
                 clock_sync=clock_sync,
             )
             if seg is None:
-                return  # duplicate segment, already displayed
+                return
             peer_name = msg.get("speaker_name", node_id[:8])
             display_name = peer.display_name if peer else node_id[:8]
             self.call_from_thread(
                 self._on_peer_transcript,
-                msg["text"], peer_name, display_name,
+                msg["text"], peer_name, display_name, node_id,
             )
 
         def on_partial(node_id, msg):
@@ -1792,12 +1814,14 @@ class VoxTerm(App):
         mgr.on_final_received = on_final
         mgr.on_partial_received = on_partial
 
-    def _on_peer_transcript(self, text: str, speaker: str, peer_display_name: str):
+    def _on_peer_transcript(self, text: str, speaker: str, peer_display_name: str, node_id: str):
         """Called on main thread when a peer's FINAL segment arrives."""
-        self.query_one(TranscriptPanel).add_transcript(
-            text, f"{peer_display_name}:{speaker}", 0,
-            confidence="",
-        )
+        tp = self.query_one(TranscriptPanel)
+        # First line from a new peer — subtle annotation
+        if node_id not in self._peer_first_transcript:
+            self._peer_first_transcript.add(node_id)
+            tp.system_message(f"— shared via {peer_display_name}'s mic —")
+        tp.add_transcript(text, f"{peer_display_name}:{speaker}", 0, confidence="")
         self._append_live_transcript(text, f"{peer_display_name}:{speaker}", 0)
 
     def _p2p_system_msg(self, text: str) -> None:
@@ -1905,24 +1929,6 @@ if __name__ == "__main__":
         action="store_true",
         help="List available models and exit",
     )
-    parser.add_argument(
-        "--name",
-        type=str,
-        default=None,
-        help="Display name for P2P sessions",
-    )
-    parser.add_argument(
-        "--session-create",
-        action="store_true",
-        help="Create a P2P session on launch",
-    )
-    parser.add_argument(
-        "--session-join",
-        type=str,
-        default=None,
-        metavar="CODE",
-        help="Join a P2P session on launch (e.g. --session-join VOXJ-7K3M)",
-    )
     args = parser.parse_args()
 
     if args.list_models:
@@ -1979,12 +1985,7 @@ if __name__ == "__main__":
     # Restore terminal on segfault so the shell doesn't get stuck in raw mode
     diagnostics.setup_signal_handlers()
 
-    app = VoxTerm(
-        transcriber=transcriber, model_name=model_name, language=language,
-        p2p_name=args.name,
-        p2p_create=args.session_create,
-        p2p_join_code=args.session_join,
-    )
+    app = VoxTerm(transcriber=transcriber, model_name=model_name, language=language)
 
     # Global exception hooks — dump diagnostics on any uncaught crash
     diagnostics.setup_exception_hooks(app)
