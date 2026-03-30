@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import queue
 import sys
 import os
 import shutil
@@ -76,6 +77,20 @@ def _clipboard_cmd() -> list[str] | None:
     if shutil.which("wl-copy"):
         return ["wl-copy"]
     return None
+
+# P2P networking — optional, gracefully degrade if dependencies missing
+try:
+    from network.session import SessionManager
+    from network.segments import TranscriptAssembler
+    from network.crypto import generate_session_code, derive_session_key
+    from network.debug import P2PDebugStats
+    from network.discovery import PeerDiscovery
+    from network.audio_stream import AudioStreamer
+    from audio.merger import PeerAudioMixer
+    from widgets.peer_browser import SessionCreateScreen, SessionJoinScreen
+    _P2P_AVAILABLE = True
+except ImportError:
+    _P2P_AVAILABLE = False
 
 from config_store import ConfigStore
 
@@ -277,6 +292,9 @@ class HelpScreen(ModalScreen):
                 "[bold #00e5ff]S[/]       [#c0c0c0]Save / copy transcript[/]\n"
                 "[bold #00e5ff]M[/]       [#c0c0c0]Switch transcription model[/]\n"
                 "[bold #00e5ff]L[/]       [#c0c0c0]Switch language[/]\n"
+                "[bold #00e5ff]N[/]       [#c0c0c0]New P2P session (multi-device)[/]\n"
+                "[bold #00e5ff]J[/]       [#c0c0c0]Join P2P session by code[/]\n"
+                "[bold #00e5ff]V[/]       [#c0c0c0]Toggle merged transcript view (P2P)[/]\n"
                 "[bold #00e5ff]C[/]       [#c0c0c0]Clear transcript[/]\n"
                 "[bold #00e5ff]D[/]       [#c0c0c0]Toggle debug mode[/]\n"
                 "[bold #00e5ff]Q[/]       [#c0c0c0]Quit[/]",
@@ -366,12 +384,19 @@ class VoxTerm(App):
         Binding("s", "export_transcript", "Export"),
         Binding("d", "toggle_debug", "Debug"),
         Binding("c", "clear_transcript", "Clear"),
+        Binding("n", "new_session", "Session"),
+        Binding("j", "join_session", "Join"),
+        Binding("v", "toggle_merged_view", "View"),
         Binding("?", "show_help", "Help", key_display="?"),
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, transcriber=None, model_name="qwen3-0.6b", language="en"):
+    def __init__(self, transcriber=None, model_name="qwen3-0.6b", language="en",
+                 p2p_name=None, p2p_create=False, p2p_join_code=None):
         super().__init__()
+        self._p2p_auto_name = p2p_name
+        self._p2p_auto_create = p2p_create
+        self._p2p_auto_join_code = p2p_join_code
         self.audio_capture = AudioCapture()
         self.system_capture = SystemCapture()
         self.audio_buffer = AudioBuffer()
@@ -404,6 +429,18 @@ class VoxTerm(App):
         self._prompt_confirmations: dict[int, int] = {}  # speaker_id → confirm count
         self._last_prompt_time: float = 0.0
         self._onboarding_shown = False
+        # P2P networking state
+        self._session_mgr: SessionManager | None = None
+        self._discovery: PeerDiscovery | None = None
+        self._p2p_display_name: str = ""
+        self._p2p_node_id: str = ""
+        self._transcript_seq: int = 0
+        self._assembler = TranscriptAssembler() if _P2P_AVAILABLE else None
+        self._p2p_debug = P2PDebugStats() if _P2P_AVAILABLE else None
+        self._p2p_send_queue: queue.Queue | None = None
+        self._audio_streamer: AudioStreamer | None = None if _P2P_AVAILABLE else None
+        self._peer_mixer: PeerAudioMixer | None = None if _P2P_AVAILABLE else None
+        self._audio_send_seq: int = 0
 
     def compose(self) -> ComposeResult:
         yield CyberHeader()
@@ -419,6 +456,8 @@ class VoxTerm(App):
             " [bold #00e5ff]\\[R][/][#607080] Record  [/]"
             "[bold #00e5ff]\\[T][/][#607080] Tag  [/]"
             "[bold #00e5ff]\\[P][/][#607080] Profiles  [/]"
+            "[bold #00e5ff]\\[N][/][#607080] Session  [/]"
+            "[bold #00e5ff]\\[V][/][#607080] Merged  [/]"
             "[bold #00e5ff]\\[?][/][#607080] Help[/]",
             id="footer-bar",
             markup=True,
@@ -451,6 +490,25 @@ class VoxTerm(App):
                 )
             self._start_audio_timer()
             self._load_model()
+
+        # Start P2P peer discovery on launch (just visibility, no session)
+        if _P2P_AVAILABLE:
+            self._start_peer_discovery()
+            # Auto-create or auto-join session from CLI flags
+            if self._p2p_auto_create or self._p2p_auto_join_code:
+                name = self._p2p_auto_name or "voxterm"
+                self._p2p_display_name = name
+                self._ensure_p2p_identity()
+                if self._p2p_auto_create:
+                    code = generate_session_code()
+                    tp = self.query_one(TranscriptPanel)
+                    tp.system_message(f"P2P session starting (code: {code})...")
+                    self._start_p2p_session(code, is_creator=True)
+                elif self._p2p_auto_join_code:
+                    code = self._p2p_auto_join_code
+                    tp = self.query_one(TranscriptPanel)
+                    tp.system_message(f"Joining P2P session: {code}...")
+                    self._start_p2p_session(code, is_creator=False)
 
     @property
     def _chunk_duration(self) -> float:
@@ -490,11 +548,24 @@ class VoxTerm(App):
         else:
             saved_text = ""
 
+        # P2P indicator
+        p2p_text = ""
+        if self._session_mgr and self._session_mgr.is_in_session:
+            pc = self._session_mgr.peer_count
+            code = self._session_mgr.session_code or ""
+            view_tag = " MERGED" if self.query_one(TranscriptPanel).merged_view else ""
+            p2p_text = f"    [#00e5ff]P2P {code} ({pc} peer{'s' if pc != 1 else ''}){view_tag}[/]"
+        elif self._discovery:
+            visible = len(self._discovery.get_visible_peers())
+            if visible > 0:
+                p2p_text = f"    [#00e5ff]{visible} peer{'s' if visible != 1 else ''} on network[/]"
+
         self.query_one("#telemetry", Static).update(
             f"  {status}"
             f"    [#00ffcc]{model_text}[/]"
             f"    [#ffaa66]{lang_text}[/]"
             f"{spk_text}"
+            f"{p2p_text}"
             f"{saved_text}"
         )
 
@@ -587,6 +658,19 @@ class VoxTerm(App):
 
         mic_chunks = self.audio_capture.drain()
         sys_chunks = self.system_capture.drain()
+
+        # Send raw mic audio to peers via UDP (before mixing with system)
+        if mic_chunks and self._audio_streamer and self._session_mgr:
+            peer_addrs = self._get_peer_udp_addrs()
+            if peer_addrs:
+                now = time.monotonic()
+                for chunk in mic_chunks:
+                    self._audio_streamer.send_frame(
+                        chunk, seq=self._audio_send_seq,
+                        timestamp=now, peer_addrs=peer_addrs,
+                    )
+                    self._audio_send_seq += 1
+
         chunks = self._mix_chunks(mic_chunks, sys_chunks) if sys_chunks else mic_chunks
         if not chunks:
             waveform.tick()
@@ -596,6 +680,7 @@ class VoxTerm(App):
             waveform.push_samples(chunk)
 
             # Speech detection: Silero VAD (neural) with RMS fallback
+            # Runs on local audio immediately (no merge delay)
             if self.vad.is_loaded:
                 is_speech = self.vad.is_speech(chunk)
             else:
@@ -605,16 +690,47 @@ class VoxTerm(App):
             if is_speech:
                 self._silence_chunks = 0
                 self._had_speech = True
-                self.audio_buffer.append(chunk)
             else:
                 self._silence_chunks += 1
-                # Only buffer silence if we're in an active speech segment
-                if self._had_speech:
+
+            # Feed chunk through the merger (adds peer audio, applies jitter delay)
+            if self._peer_mixer is not None:
+                merged_chunks = self._peer_mixer.add_local_chunk(chunk, time.monotonic())
+                for mc in merged_chunks:
+                    if self._had_speech or is_speech:
+                        self.audio_buffer.append(mc)
+            else:
+                # No merger — original behavior
+                if is_speech:
+                    self.audio_buffer.append(chunk)
+                elif self._had_speech:
                     self.audio_buffer.append(chunk)
 
         waveform.tick()
 
+        # Update waveform merge indicator (~every 0.5s, not every frame)
+        mixer = self._peer_mixer
+        if mixer and mixer.active_peers > 0 and self._recording:
+            self._merge_display_counter = getattr(self, '_merge_display_counter', 0) + 1
+            if self._merge_display_counter % 8 == 0:  # ~0.5s at 15fps
+                stats = mixer.get_stats()
+                weights = stats.get("live_weights", {})
+                if weights:
+                    names = self._get_peer_names()
+                    parts = []
+                    for nid, w in sorted(weights.items(), key=lambda x: -x[1]):
+                        name = "you" if nid == "__local__" else names.get(nid, nid[:6])
+                        parts.append(f"{name} {int(w*100)}%")
+                    waveform.set_merge_status(" | ".join(parts))
+                else:
+                    waveform.set_merge_status("")
+        elif not mixer or mixer.active_peers == 0:
+            if getattr(self, '_merge_display_counter', 0) > 0:
+                self._merge_display_counter = 0
+                waveform.set_merge_status("")
+
         # Check transcription trigger
+        merge_delay = self._peer_mixer.merge_delay if self._peer_mixer else 0.0
         silence_duration = self._silence_chunks * self._chunk_duration
         buffer_duration = self.audio_buffer.duration
 
@@ -644,12 +760,34 @@ class VoxTerm(App):
             now = time.time()
             if buffer_duration > 0.5 and now - self._last_dbg > 3:
                 self._last_dbg = now
-                self.query_one(TranscriptPanel).system_message(
+                dbg_parts = [
                     f"[dbg] buf={buffer_duration:.1f}s sil={silence_duration:.1f}s "
                     f"speech={self._had_speech}"
+                ]
+                if self._session_mgr and self._session_mgr.is_in_session:
+                    tp = self.query_one(TranscriptPanel)
+                    mixer = self._peer_mixer
+                    if self._assembler:
+                        dbg_parts.append(
+                            f"  asm={self._assembler.final_count}F/{self._assembler.partial_count}P "
+                            f"view={'MERGED' if tp.merged_view else 'LOCAL'}"
+                        )
+                    if mixer and mixer.active_peers > 0:
+                        stats = mixer.get_stats()
+                        weights = stats.get("live_weights", {})
+                        if weights:
+                            names = self._get_peer_names()
+                            parts = []
+                            for nid, w in sorted(weights.items(), key=lambda x: -x[1]):
+                                name = "you" if nid == "__local__" else names.get(nid, nid[:6])
+                                parts.append(f"{name}={int(w*100)}%")
+                            dbg_parts.append(f"  mix=[{' | '.join(parts)}]")
+                self.query_one(TranscriptPanel).system_message(
+                    "".join(dbg_parts)
                 )
 
-        if self._had_speech and silence_duration > SILENCE_TRIGGER_SECONDS and buffer_duration > MIN_BUFFER_SECONDS:
+        effective_silence_trigger = SILENCE_TRIGGER_SECONDS + merge_delay
+        if self._had_speech and silence_duration > effective_silence_trigger and buffer_duration > MIN_BUFFER_SECONDS:
             self._trigger_transcription()
         elif buffer_duration >= MAX_BUFFER_SECONDS:
             self._trigger_transcription()
@@ -852,6 +990,39 @@ class VoxTerm(App):
         )
         self._append_live_transcript(text, speaker, speaker_id)
         self._update_telemetry()
+
+        # Broadcast to P2P peers if in a session (via bounded queue, not per-call threads)
+        if self._session_mgr and self._session_mgr.is_in_session and self._p2p_send_queue:
+            self._transcript_seq += 1
+            now = time.monotonic()
+            try:
+                self._p2p_send_queue.put_nowait(dict(
+                    speaker_name=speaker or self._p2p_display_name,
+                    seq=self._transcript_seq, text=text,
+                    start_ts=now, end_ts=now,
+                    confidence=0.9,
+                ))
+            except Exception:
+                pass  # queue full — drop rather than leak threads
+
+            # Track local segment in assembler for merged view
+            if self._assembler:
+                dom = ""
+                if self._peer_mixer and self._peer_mixer.active_peers > 0:
+                    dom = self._peer_mixer.dominant_source
+                self._assembler.add_local(
+                    self._transcript_seq,
+                    speaker or self._p2p_display_name,
+                    text, now, now, confidence=0.9,
+                    dominant_mic=dom,
+                )
+                tp = self.query_one(TranscriptPanel)
+                if tp.merged_view:
+                    tp.refresh_merged(
+                        self._assembler,
+                        local_name=self._p2p_display_name or "you",
+                        peer_names=self._get_peer_names(),
+                    )
 
         # First-use onboarding tip
         if (
@@ -1413,13 +1584,495 @@ class VoxTerm(App):
             except Exception:
                 pass
 
+    # ── P2P session actions ─────────────────────────────────────
+
+    def _ensure_p2p_identity(self) -> None:
+        """Generate a stable node_id for this session (once per app run)."""
+        if not self._p2p_node_id:
+            import uuid
+            self._p2p_node_id = str(uuid.uuid4()).replace("-", "")[:16]
+
+    def _start_discovery(self, tcp_port: int, on_peer_found=None) -> None:
+        """Start mDNS discovery with the actual TCP port."""
+        if self._discovery is not None:
+            self._discovery.stop()
+        self._ensure_p2p_identity()
+        self._discovery = PeerDiscovery(
+            self._p2p_node_id,
+            self._p2p_display_name or "voxterm",
+            tcp_port=tcp_port,
+            udp_port=0,
+        )
+        # Set callback BEFORE start() to avoid missing early peer events
+        if on_peer_found is not None:
+            self._discovery.on_peer_found = on_peer_found
+        self._discovery.start()
+
+    @work(thread=True, group="p2p_discovery")
+    def _start_peer_discovery(self) -> None:
+        """Start mDNS discovery on launch — just show who's on the network."""
+        try:
+            self._ensure_p2p_identity()
+            self._discovery = PeerDiscovery(
+                self._p2p_node_id,
+                self._p2p_display_name or "voxterm",
+                tcp_port=0,
+                udp_port=0,
+            )
+
+            def on_found(peer_info):
+                self.call_from_thread(
+                    self._p2p_debug_msg,
+                    f"peer online: {peer_info.display_name} ({peer_info.ip})"
+                )
+                self.call_from_thread(self._update_telemetry)
+
+            def on_lost(node_id):
+                self.call_from_thread(
+                    self._p2p_debug_msg,
+                    f"peer offline: {node_id[:8]}"
+                )
+                self.call_from_thread(self._update_telemetry)
+
+            self._discovery.on_peer_found = on_found
+            self._discovery.on_peer_lost = on_lost
+            self._discovery.start()
+
+            self.call_from_thread(
+                self._p2p_debug_msg,
+                "scanning network for VoxTerm peers..."
+            )
+        except Exception as exc:
+            self.call_from_thread(
+                self._p2p_debug_msg,
+                f"peer discovery failed: {exc}"
+            )
+
+    def _stop_discovery(self) -> None:
+        """Stop mDNS discovery and clean up."""
+        if self._discovery:
+            self._discovery.stop()
+            self._discovery = None
+
+    def action_new_session(self):
+        if not _P2P_AVAILABLE:
+            self.query_one(TranscriptPanel).system_message(
+                "P2P unavailable — install zeroconf and cryptography"
+            )
+            return
+        if self._session_mgr and self._session_mgr.is_in_session:
+            self.query_one(TranscriptPanel).system_message("already in a session")
+            return
+        code = generate_session_code()
+        self.push_screen(SessionCreateScreen(code), self._on_session_create_result)
+
+    def _on_session_create_result(self, result: dict | None) -> None:
+        if result is None:
+            return
+        name = result["display_name"]
+        code = result["session_code"]
+        self._p2p_display_name = name
+        self._ensure_p2p_identity()
+        # Cancel the auto-discovery worker BEFORE stopping discovery —
+        # prevents the worker from overwriting self._discovery after we nil it.
+        self.workers.cancel_group(self, "p2p_discovery")
+        self._stop_discovery()  # stop auto-discovery before session setup
+
+        tp = self.query_one(TranscriptPanel)
+        tp.system_message(f"P2P session starting...")
+        self._start_p2p_session(code, is_creator=True)
+
+    @work(thread=True, group="p2p_setup")
+    def _start_p2p_session(self, code: str, is_creator: bool) -> None:
+        """Start P2P session in a worker thread to avoid blocking the event loop."""
+        try:
+            # Shut down any previous session manager that may be orphaned
+            # from a cancelled worker (thread=True workers can't be interrupted)
+            old_mgr = self._session_mgr
+            if old_mgr is not None:
+                try:
+                    old_mgr.leave_session()
+                except Exception:
+                    pass
+
+            # Start audio streamer for multi-mic merging
+            from config import P2P_AUDIO_MERGE_ENABLED
+            audio_merge = P2P_AUDIO_MERGE_ENABLED and _P2P_AVAILABLE
+            node_id_bytes = self._p2p_node_id.encode("utf-8")[:16].ljust(16, b"\x00")
+            session_key = derive_session_key(code)
+
+            if audio_merge:
+                streamer = AudioStreamer(node_id_bytes, session_key, udp_port=0)
+                streamer.start()
+                udp_audio_port = streamer.local_port
+
+                mixer = PeerAudioMixer()
+                self._audio_streamer = streamer
+                self._peer_mixer = mixer
+                self._audio_send_seq = 0
+
+                # Wire audio frame reception into the mixer
+                def on_audio_frame(nid_bytes, seq, timestamp, pcm_bytes):
+                    nid = nid_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
+                    mixer.peer_frame(nid, seq, pcm_bytes)
+
+                streamer.on_frame_received = on_audio_frame
+            else:
+                udp_audio_port = 0
+                self._audio_streamer = None
+                self._peer_mixer = None
+
+            mgr = SessionManager(
+                self._p2p_display_name, node_id=self._p2p_node_id, tcp_port=0,
+                audio_merge=audio_merge, udp_audio_port=udp_audio_port,
+            )
+            self._session_mgr = mgr
+            self._wire_session_callbacks()
+
+            if is_creator:
+                mgr.create_session()
+                # Override with the code from the UI (create_session generates its own)
+                mgr._session_code = code
+                mgr._session_key = derive_session_key(code)
+            else:
+                mgr.join_session(code)
+            port = mgr._server_sock.getsockname()[1]
+
+            # Start bounded sender thread for P2P broadcast (replaces per-call threads)
+            self._p2p_send_queue = queue.Queue(maxsize=64)
+            send_q = self._p2p_send_queue
+
+            def _p2p_sender_loop():
+                while mgr._running:
+                    try:
+                        kwargs = send_q.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    try:
+                        mgr.broadcast_final(**kwargs)
+                    except Exception:
+                        pass
+
+            threading.Thread(
+                target=_p2p_sender_loop, daemon=True, name="p2p-sender"
+            ).start()
+
+            # Wire discovery callback BEFORE starting so we don't miss peers.
+            # Only the node with the lower node_id initiates the TCP connection.
+            # The other side accepts via the accept loop. This prevents the
+            # dual-connect race where both sides connect simultaneously,
+            # clobber each other, and immediately disconnect.
+            my_id = self._p2p_node_id
+
+            def on_peer_found(peer_info):
+                if peer_info.node_id == my_id:
+                    return
+                if mgr.has_peer(peer_info.node_id):
+                    return
+                if not peer_info.in_session:
+                    self.call_from_thread(
+                        self._p2p_debug_msg,
+                        f"found {peer_info.display_name} (idle, not in session)"
+                    )
+                    return
+                self.call_from_thread(
+                    self._p2p_debug_msg,
+                    f"found {peer_info.display_name} in session — "
+                    + ("connecting..." if my_id < peer_info.node_id else "waiting for their connection...")
+                )
+                # Tie-break: lower node_id initiates
+                if my_id < peer_info.node_id:
+                    threading.Thread(
+                        target=self._try_connect_peer,
+                        args=(peer_info,),
+                        daemon=True,
+                    ).start()
+
+            self._start_discovery(port, on_peer_found=on_peer_found)
+            self._discovery.update_session_status(True)
+
+            # Connect to any already-visible peers (same tie-break)
+            for peer_info in self._discovery.get_visible_peers():
+                if (peer_info.in_session
+                        and peer_info.node_id != my_id
+                        and my_id < peer_info.node_id):
+                    threading.Thread(
+                        target=self._try_connect_peer,
+                        args=(peer_info,),
+                        daemon=True,
+                    ).start()
+
+            # Fallback: if no peers connect within 3 seconds, try connecting
+            # to all visible peers regardless of tie-break (in case mDNS
+            # discovery was one-directional)
+            def _retry_connect():
+                import time as _time
+                _time.sleep(3.0)
+                if not mgr._running:
+                    return
+                with mgr._lock:
+                    has_peers = bool(mgr._peers)
+                if has_peers:
+                    return
+                visible = self._discovery.get_visible_peers() if self._discovery else []
+                self.call_from_thread(
+                    self._p2p_debug_msg,
+                    f"no peers after 3s, retrying... ({len(visible)} visible on network)"
+                )
+                for pi in visible:
+                    if pi.in_session and pi.node_id != my_id:
+                        with mgr._lock:
+                            if pi.node_id in mgr._peers:
+                                continue
+                        self._try_connect_peer(pi)
+
+            threading.Thread(target=_retry_connect, daemon=True).start()
+
+            if is_creator:
+                self.call_from_thread(
+                    self._p2p_session_ready,
+                    f"code: {code}  — tell others to press J and enter this",
+                )
+            else:
+                self.call_from_thread(
+                    self._p2p_session_ready,
+                    f"joining session: {code} — scanning network...",
+                )
+
+        except Exception as exc:
+            # Clean up the half-initialized session manager so the user
+            # isn't stuck in "already in a session" state forever.
+            self._stop_audio_merge()
+            try:
+                if self._session_mgr is not None:
+                    self._session_mgr.leave_session()
+            except Exception:
+                pass
+            self._session_mgr = None
+            self.call_from_thread(
+                self.query_one(TranscriptPanel).system_message,
+                f"P2P session failed: {exc}",
+            )
+
+    def _p2p_session_ready(self, status_msg: str) -> None:
+        """Called on main thread when P2P session is ready."""
+        tp = self.query_one(TranscriptPanel)
+        tp.system_message("P2P session active")
+        tp.system_message(status_msg)
+        self._update_telemetry()
+
+    def action_join_session(self):
+        if not _P2P_AVAILABLE:
+            self.query_one(TranscriptPanel).system_message(
+                "P2P unavailable — install zeroconf and cryptography"
+            )
+            return
+        if self._session_mgr and self._session_mgr.is_in_session:
+            self.query_one(TranscriptPanel).system_message("already in a session")
+            return
+        self.push_screen(SessionJoinScreen(), self._on_session_join_result)
+
+    def _on_session_join_result(self, result: dict | None) -> None:
+        if result is None:
+            return
+        name = result["display_name"]
+        code = result["session_code"]
+        self._p2p_display_name = name
+        self._ensure_p2p_identity()
+        # Cancel the auto-discovery worker BEFORE stopping discovery —
+        # prevents the worker from overwriting self._discovery after we nil it.
+        self.workers.cancel_group(self, "p2p_discovery")
+        self._stop_discovery()  # stop auto-discovery before session setup
+
+        tp = self.query_one(TranscriptPanel)
+        tp.system_message(f"joining session...")
+        self._start_p2p_session(code, is_creator=False)
+
+    def _try_connect_peer(self, peer_info) -> None:
+        """Try connecting to a discovered peer (runs in background thread)."""
+        mgr = self._session_mgr
+        if not mgr or not mgr.is_in_session:
+            return
+        try:
+            success = mgr.join_by_ip(
+                peer_info.ip, peer_info.tcp_port,
+                mgr.session_code,
+            )
+            if not success:
+                self.call_from_thread(
+                    self._p2p_debug_msg,
+                    f"connection to {peer_info.display_name} failed (wrong session or unreachable)"
+                )
+        except Exception as exc:
+            self.call_from_thread(
+                self._p2p_debug_msg,
+                f"connection error: {exc}"
+            )
+
+    def _stop_audio_merge(self) -> None:
+        """Stop audio streamer and flush the merger."""
+        if self._audio_streamer:
+            self._audio_streamer.stop()
+            self._audio_streamer = None
+        if self._peer_mixer:
+            # Flush remaining buffered chunks into the audio buffer
+            for chunk in self._peer_mixer.flush():
+                self.audio_buffer.append(chunk)
+            self._peer_mixer = None
+
+    def _get_peer_udp_addrs(self) -> list[tuple[str, int]]:
+        """Return (ip, udp_audio_port) for all connected peers that support audio merge."""
+        mgr = self._session_mgr
+        if not mgr:
+            return []
+        peers = mgr.peers
+        return [
+            (p.ip, p.udp_audio_port)
+            for p in peers.values()
+            if p.audio_merge_capable and p.udp_audio_port > 0
+        ]
+
+    def _p2p_debug_msg(self, text: str) -> None:
+        """Show a P2P debug message in the transcript."""
+        self.query_one(TranscriptPanel).system_message(f"[P2P] {text}")
+
+    def _wire_session_callbacks(self) -> None:
+        mgr = self._session_mgr
+
+        def _mixer_key(node_id: str) -> str:
+            """Truncate node_id to match the 16-byte UDP wire format."""
+            return node_id.encode("utf-8")[:16].rstrip(b"\x00").decode("utf-8", errors="replace")
+
+        def on_connected(peer):
+            # Register peer in the audio mixer for multi-mic merging
+            if self._peer_mixer and peer.audio_merge_capable:
+                self._peer_mixer.register_peer(_mixer_key(peer.node_id), peer.clock)
+                merge_msg = " (audio merge)"
+            else:
+                merge_msg = ""
+            self.call_from_thread(
+                self.query_one(TranscriptPanel).system_message,
+                f"{peer.display_name} connected{merge_msg}"
+            )
+            self.call_from_thread(self._update_telemetry)
+
+        def on_disconnected(node_id, display_name):
+            # Remove peer from audio mixer
+            if self._peer_mixer:
+                self._peer_mixer.remove_peer(_mixer_key(node_id))
+            self.call_from_thread(
+                self.query_one(TranscriptPanel).system_message,
+                f"{display_name} disconnected"
+            )
+            if self._assembler:
+                self._assembler.clear_peer(node_id)
+            self.call_from_thread(self._update_telemetry)
+
+        def on_final(node_id, msg):
+            if not self._assembler:
+                return
+            peers = mgr.peers
+            peer = peers.get(node_id)
+            clock_sync = peer.clock if peer else None
+            seg = self._assembler.on_final(
+                node_id, msg["seq"], msg["speaker_name"], msg["text"],
+                msg["start_ts"], msg["end_ts"], msg["confidence"],
+                clock_sync=clock_sync,
+            )
+            if seg is None:
+                return  # duplicate segment, already displayed
+            peer_name = msg.get("speaker_name", node_id[:8])
+            display_name = peer.display_name if peer else node_id[:8]
+            self.call_from_thread(
+                self._on_peer_transcript,
+                msg["text"], peer_name, display_name,
+            )
+
+        def on_partial(node_id, msg):
+            if not self._assembler:
+                return
+            peers = mgr.peers
+            peer = peers.get(node_id)
+            clock_sync = peer.clock if peer else None
+            self._assembler.on_partial(
+                node_id, msg["seq"], msg["speaker_name"], msg["text"],
+                msg["start_ts"], clock_sync=clock_sync,
+            )
+            self.call_from_thread(self._refresh_merged_if_active)
+
+        mgr.on_peer_connected = on_connected
+        mgr.on_peer_disconnected = on_disconnected
+        mgr.on_final_received = on_final
+        mgr.on_partial_received = on_partial
+
+    def _on_peer_transcript(self, text: str, speaker: str, peer_display_name: str):
+        """Called on main thread when a peer's FINAL segment arrives."""
+        tp = self.query_one(TranscriptPanel)
+        tp.add_transcript(
+            text, f"{peer_display_name}:{speaker}", 0,
+            confidence="",
+        )
+        self._append_live_transcript(text, f"{peer_display_name}:{speaker}", 0)
+        # Refresh merged view if active
+        if tp.merged_view and self._assembler:
+            tp.refresh_merged(
+                self._assembler,
+                local_name=self._p2p_display_name or "you",
+                peer_names=self._get_peer_names(),
+            )
+
     def action_show_help(self):
         self.push_screen(HelpScreen())
 
     def action_toggle_debug(self):
         self._debug = not self._debug
         state = "ON" if self._debug else "OFF"
-        self.query_one(TranscriptPanel).system_message(f"debug mode {state}")
+        tp = self.query_one(TranscriptPanel)
+        tp.system_message(f"debug mode {state}")
+        if self._debug and self._session_mgr and self._session_mgr.is_in_session and self._p2p_debug:
+            tp.system_message(self._p2p_debug.format_debug_text(
+                self._session_mgr, mixer=self._peer_mixer,
+                assembler=self._assembler, merged_view=tp.merged_view,
+            ))
+
+    def action_toggle_merged_view(self):
+        """Toggle between local and merged transcript view (P2P only)."""
+        if not self._session_mgr or not self._session_mgr.is_in_session:
+            self.query_one(TranscriptPanel).system_message(
+                "merged view requires an active P2P session"
+            )
+            return
+        tp = self.query_one(TranscriptPanel)
+        new_state = not tp.merged_view
+        tp.set_merged_view(
+            new_state,
+            assembler=self._assembler,
+            local_name=self._p2p_display_name or "you",
+            peer_names=self._get_peer_names(),
+        )
+        if new_state:
+            tp.system_message("merged view — all peers, time-ordered [V] to toggle back")
+        # Update telemetry to show view mode
+        self._update_telemetry()
+
+    def _refresh_merged_if_active(self):
+        """Refresh merged view if it's currently active."""
+        tp = self.query_one(TranscriptPanel)
+        if tp.merged_view and self._assembler:
+            tp.refresh_merged(
+                self._assembler,
+                local_name=self._p2p_display_name or "you",
+                peer_names=self._get_peer_names(),
+            )
+
+    def _get_peer_names(self) -> dict[str, str]:
+        """Build node_id → display_name mapping from current peers."""
+        if not self._session_mgr:
+            return {}
+        return {
+            nid: p.display_name
+            for nid, p in self._session_mgr.peers.items()
+        }
 
     def action_clear_transcript(self):
         """Clear display only — live file stays on disk as the record."""
@@ -1430,9 +2083,22 @@ class VoxTerm(App):
         self.vad.reset()
         if self._diarizer_loaded:
             self.diarizer.reset_session()
+        if self._assembler:
+            self._assembler.clear()
         self._speaker_profile_map.clear()
 
     def action_quit(self):
+        # Cancel any in-progress P2P workers before cleanup
+        self.workers.cancel_group(self, "p2p_setup")
+        self.workers.cancel_group(self, "p2p_discovery")
+        # Leave P2P session and stop discovery
+        self._stop_discovery()
+        self._stop_audio_merge()
+        if self._session_mgr and self._session_mgr.is_in_session:
+            try:
+                self._session_mgr.leave_session()
+            except Exception:
+                pass
         # Live file already on disk — no extra save needed
         self._record_session_stats()
         self.audio_capture.stop()
@@ -1487,6 +2153,24 @@ if __name__ == "__main__":
         "--list-models",
         action="store_true",
         help="List available models and exit",
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Display name for P2P sessions",
+    )
+    parser.add_argument(
+        "--session-create",
+        action="store_true",
+        help="Create a P2P session on launch",
+    )
+    parser.add_argument(
+        "--session-join",
+        type=str,
+        default=None,
+        metavar="CODE",
+        help="Join a P2P session on launch (e.g. --session-join bacon-horse-galaxy)",
     )
     args = parser.parse_args()
 
@@ -1552,7 +2236,12 @@ if __name__ == "__main__":
     # Restore terminal on segfault so the shell doesn't get stuck in raw mode
     diagnostics.setup_signal_handlers()
 
-    app = VoxTerm(transcriber=transcriber, model_name=model_name, language=language)
+    app = VoxTerm(
+        transcriber=transcriber, model_name=model_name, language=language,
+        p2p_name=args.name,
+        p2p_create=args.session_create,
+        p2p_join_code=args.session_join,
+    )
 
     # Global exception hooks — dump diagnostics on any uncaught crash
     diagnostics.setup_exception_hooks(app)
