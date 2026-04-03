@@ -78,6 +78,7 @@ def _clipboard_cmd() -> list[str] | None:
         return ["wl-copy"]
     return None
 
+
 # P2P networking — optional, gracefully degrade if dependencies missing
 try:
     from network.session import SessionManager
@@ -248,6 +249,64 @@ class LanguageSelectScreen(ModalScreen):
         self.dismiss(None)
 
 
+class QuitConfirmScreen(ModalScreen):
+    """Confirmation dialog when quitting during an active recording."""
+
+    DEFAULT_CSS = """
+    QuitConfirmScreen {
+        align: center middle;
+    }
+    #quit-dialog {
+        width: 52;
+        height: 12;
+        border: heavy #ff6600;
+        border-title-color: #ffaa00;
+        border-title-style: bold;
+        background: #0a0e14;
+        padding: 1 2;
+    }
+    #quit-list {
+        height: 4;
+        background: #0a0e14;
+        color: #c0c0c0;
+    }
+    #quit-list > .option-list--option-highlighted {
+        background: #1a1a3a;
+        color: #00ffcc;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("q", "confirm_quit", "Quit"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quit-dialog") as dialog:
+            dialog.border_title = "QUIT?"
+            yield Static(
+                "[#ffaa00]Recording is active.[/]\n"
+                "Transcript is auto-saved. Current segment will be lost.",
+                markup=True,
+            )
+            yield Static("")
+            yield OptionList(
+                Option("  Quit anyway", id="quit"),
+                Option("  Cancel", id="cancel"),
+                id="quit-list",
+            )
+            yield Static("[dim]Q to quit  ·  ESC to cancel[/]", markup=True)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id == "quit")
+
+    def action_confirm_quit(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class HelpScreen(ModalScreen):
     """Modal showing all keyboard shortcuts."""
 
@@ -411,6 +470,7 @@ class VoxTerm(App):
         self._had_speech = False
         self._silence_chunks = 0
         self._transcribing = threading.Event()  # set = busy, clear = idle
+        self._transcribe_lock = threading.Lock()  # serialize MLX GPU access
         self._transcribe_started: float = 0.0
         self._debug = False
         self._last_dbg: float = 0.0
@@ -432,7 +492,7 @@ class VoxTerm(App):
         # P2P networking state
         self._session_mgr: SessionManager | None = None
         self._discovery: PeerDiscovery | None = None
-        self._p2p_display_name: str = ""
+        self._p2p_display_name: str = _get_config().get("p2p_display_name") or os.getlogin()
         self._p2p_node_id: str = ""
         self._transcript_seq: int = 0
         self._assembler = TranscriptAssembler() if _P2P_AVAILABLE else None
@@ -815,9 +875,11 @@ class VoxTerm(App):
                     f"[dbg] transcribing {duration:.1f}s audio..."
                 )
             # 1. Transcribe (Qwen3: ~100ms, Whisper: ~2-4s)
-            # MLX runs in main process; PyTorch diarizer runs in subprocess.
-            # No lock needed — they're in separate processes.
-            result = self.transcriber.transcribe(audio)
+            # MLX Metal command buffers are NOT thread-safe — concurrent GPU
+            # submissions from multiple Textual workers cause segfaults.
+            # Serialize with a lock.
+            with self._transcribe_lock:
+                result = self.transcriber.transcribe(audio)
 
             # Periodic GC to prevent MLX memory buildup
             self._transcribe_count += 1
@@ -1587,10 +1649,14 @@ class VoxTerm(App):
     # ── P2P session actions ─────────────────────────────────────
 
     def _ensure_p2p_identity(self) -> None:
-        """Generate a stable node_id for this session (once per app run)."""
+        """Generate a stable node_id and persist display name (once per app run)."""
         if not self._p2p_node_id:
             import uuid
             self._p2p_node_id = str(uuid.uuid4()).replace("-", "")[:16]
+        # Save display name to config if not already saved
+        cfg = _get_config()
+        if not cfg.get("p2p_display_name"):
+            cfg.set("p2p_display_name", self._p2p_display_name)
 
     def _start_discovery(self, tcp_port: int, on_peer_found=None) -> None:
         """Start mDNS discovery with the actual TCP port."""
@@ -1621,6 +1687,8 @@ class VoxTerm(App):
             )
 
             def on_found(peer_info):
+                if peer_info.node_id == self._p2p_node_id:
+                    return
                 self.call_from_thread(
                     self._p2p_debug_msg,
                     f"peer online: {peer_info.display_name} ({peer_info.ip})"

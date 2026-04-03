@@ -37,6 +37,7 @@ class PeerInfo:
     tcp_port: int
     udp_port: int
     in_session: bool
+    group_name: str = ""
     proto_v: int = 1
 
 
@@ -65,6 +66,7 @@ class PeerDiscovery:
         self._tcp_port = tcp_port
         self._udp_port = udp_port
         self._in_session = False
+        self._group_name = ""
 
         self._zeroconf: Zeroconf | None = None
         self._browser: ServiceBrowser | None = None
@@ -101,6 +103,18 @@ class PeerDiscovery:
             self._zeroconf.close()
             self._zeroconf = None
         log.info("mDNS stopped")
+
+    def update_group(self, group_name: str, in_session: bool) -> None:
+        """Update mDNS TXT record with group name and session status."""
+        self._group_name = group_name
+        self._in_session = in_session
+        if self._zeroconf and self._service_info:
+            new_info = self._build_service_info()
+            try:
+                self._zeroconf.update_service(new_info)
+                self._service_info = new_info
+            except Exception:
+                log.debug("Failed to update mDNS service")
 
     def update_session_status(self, in_session: bool) -> None:
         """Update the mDNS TXT record to reflect session status."""
@@ -143,6 +157,7 @@ class PeerDiscovery:
             properties={
                 "node_id": self._node_id,
                 "display_name": self._display_name,
+                "group_name": self._group_name,
                 "in_session": "1" if self._in_session else "0",
                 "proto_v": "1",
                 "tcp_port": str(self._tcp_port),
@@ -220,6 +235,7 @@ class PeerDiscovery:
                 tcp_port=int(props.get(b"tcp_port", str(info.port).encode()).decode()),
                 udp_port=int(props.get(b"udp_port", b"0").decode()),
                 in_session=props.get(b"in_session", b"0") == b"1",
+                group_name=(props.get(b"group_name") or b"").decode("utf-8", errors="replace"),
                 proto_v=int(props.get(b"proto_v", b"1").decode()),
             )
         except (KeyError, ValueError, IndexError) as exc:
