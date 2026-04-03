@@ -1940,6 +1940,11 @@ class VoxTerm(App):
     def _party_ready(self, is_host: bool) -> None:
         """Called on main thread when party session is ready."""
         self._party_state = PartyState.IN_PARTY
+        tp = self.query_one(TranscriptPanel)
+        if is_host:
+            tp.system_message("you're the party now")
+        else:
+            tp.system_message("found the party")
         self._update_telemetry()
         # Set borders to the party color — stays for the duration of the party
         self._apply_party_color()
