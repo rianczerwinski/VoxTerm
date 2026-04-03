@@ -34,6 +34,7 @@ diagnostics.rotate_crash_logs()
 import warnings
 warnings.filterwarnings("ignore", message="resource_tracker", category=UserWarning)
 
+from enum import Enum
 import numpy as np
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -79,6 +80,13 @@ def _clipboard_cmd() -> list[str] | None:
     return None
 
 
+class PartyState(Enum):
+    SOLO = "solo"           # not in party mode
+    SCANNING = "scanning"   # pressed N, looking for groups
+    JOINING = "joining"     # connecting to a group
+    IN_PARTY = "in_party"   # connected, transcripts flowing
+
+
 # P2P networking — optional, gracefully degrade if dependencies missing
 try:
     from network.session import SessionManager
@@ -88,7 +96,6 @@ try:
     from network.discovery import PeerDiscovery
     from network.audio_stream import AudioStreamer
     from audio.merger import PeerAudioMixer
-    from widgets.peer_browser import SessionCreateScreen, SessionJoinScreen
     _P2P_AVAILABLE = True
 except ImportError:
     _P2P_AVAILABLE = False
@@ -351,9 +358,8 @@ class HelpScreen(ModalScreen):
                 "[bold #00e5ff]S[/]       [#c0c0c0]Save / copy transcript[/]\n"
                 "[bold #00e5ff]M[/]       [#c0c0c0]Switch transcription model[/]\n"
                 "[bold #00e5ff]L[/]       [#c0c0c0]Switch language[/]\n"
-                "[bold #00e5ff]N[/]       [#c0c0c0]New P2P session (multi-device)[/]\n"
-                "[bold #00e5ff]J[/]       [#c0c0c0]Join P2P session by code[/]\n"
-                "[bold #00e5ff]V[/]       [#c0c0c0]Toggle merged transcript view (P2P)[/]\n"
+                "[bold #00e5ff]N[/]       [#c0c0c0]Party mode — join / leave[/]\n"
+                "[bold #00e5ff]V[/]       [#c0c0c0]Toggle merged transcript view[/]\n"
                 "[bold #00e5ff]C[/]       [#c0c0c0]Clear transcript[/]\n"
                 "[bold #00e5ff]D[/]       [#c0c0c0]Toggle debug mode[/]\n"
                 "[bold #00e5ff]Q[/]       [#c0c0c0]Quit[/]",
@@ -443,8 +449,7 @@ class VoxTerm(App):
         Binding("s", "export_transcript", "Export"),
         Binding("d", "toggle_debug", "Debug"),
         Binding("c", "clear_transcript", "Clear"),
-        Binding("n", "new_session", "Session"),
-        Binding("j", "join_session", "Join"),
+        Binding("n", "toggle_party", "Party"),
         Binding("v", "toggle_merged_view", "View"),
         Binding("?", "show_help", "Help", key_display="?"),
         Binding("q", "quit", "Quit"),
@@ -490,6 +495,7 @@ class VoxTerm(App):
         self._last_prompt_time: float = 0.0
         self._onboarding_shown = False
         # P2P networking state
+        self._party_state = PartyState.SOLO
         self._session_mgr: SessionManager | None = None
         self._discovery: PeerDiscovery | None = None
         self._p2p_display_name: str = _get_config().get("p2p_display_name") or os.getlogin()
@@ -551,24 +557,9 @@ class VoxTerm(App):
             self._start_audio_timer()
             self._load_model()
 
-        # Start P2P peer discovery on launch (just visibility, no session)
+        # Start P2P peer discovery on launch (passive — just show who's nearby)
         if _P2P_AVAILABLE:
             self._start_peer_discovery()
-            # Auto-create or auto-join session from CLI flags
-            if self._p2p_auto_create or self._p2p_auto_join_code:
-                name = self._p2p_auto_name or "voxterm"
-                self._p2p_display_name = name
-                self._ensure_p2p_identity()
-                if self._p2p_auto_create:
-                    code = generate_session_code()
-                    tp = self.query_one(TranscriptPanel)
-                    tp.system_message(f"P2P session starting (code: {code})...")
-                    self._start_p2p_session(code, is_creator=True)
-                elif self._p2p_auto_join_code:
-                    code = self._p2p_auto_join_code
-                    tp = self.query_one(TranscriptPanel)
-                    tp.system_message(f"Joining P2P session: {code}...")
-                    self._start_p2p_session(code, is_creator=False)
 
     @property
     def _chunk_duration(self) -> float:
@@ -608,17 +599,28 @@ class VoxTerm(App):
         else:
             saved_text = ""
 
-        # P2P indicator
+        # Party mode indicator
         p2p_text = ""
-        if self._session_mgr and self._session_mgr.is_in_session:
-            pc = self._session_mgr.peer_count
-            code = self._session_mgr.session_code or ""
-            view_tag = " MERGED" if self.query_one(TranscriptPanel).merged_view else ""
-            p2p_text = f"    [#00e5ff]P2P {code} ({pc} peer{'s' if pc != 1 else ''}){view_tag}[/]"
+        if self._party_state == PartyState.SCANNING:
+            p2p_text = "    [#00e5ff]◌ looking for the party...[/]"
+        elif self._party_state == PartyState.JOINING:
+            p2p_text = "    [#00e5ff]joining the party...[/]"
+        elif self._party_state == PartyState.IN_PARTY and self._session_mgr:
+            peers = self._session_mgr.peers
+            if peers:
+                names = "  ".join(
+                    f"[#00ffcc]●[/] {p.display_name}" for p in peers.values()
+                )
+                p2p_text = f"    {names}  [#00ffcc]●[/] you"
+            else:
+                p2p_text = f"    [#00ffcc]●[/] you"
+            p2p_text += "    [dim]\\[N][/]"
         elif self._discovery:
             visible = len(self._discovery.get_visible_peers())
             if visible > 0:
-                p2p_text = f"    [#00e5ff]{visible} peer{'s' if visible != 1 else ''} on network[/]"
+                p2p_text = f"    [dim]{visible} nearby[/]  [#00e5ff]\\[N] Party[/]"
+            else:
+                p2p_text = f"    [#00e5ff]\\[N] Party[/]"
 
         self.query_one("#telemetry", Static).update(
             f"  {status}"
@@ -1722,40 +1724,82 @@ class VoxTerm(App):
             self._discovery.stop()
             self._discovery = None
 
-    def action_new_session(self):
+    def action_toggle_party(self):
+        """Toggle party mode: N to join the party, N again to leave."""
         if not _P2P_AVAILABLE:
             self.query_one(TranscriptPanel).system_message(
                 "P2P unavailable — install zeroconf and cryptography"
             )
             return
-        if self._session_mgr and self._session_mgr.is_in_session:
-            self.query_one(TranscriptPanel).system_message("already in a session")
-            return
-        code = generate_session_code()
-        self.push_screen(SessionCreateScreen(code), self._on_session_create_result)
+        if self._party_state == PartyState.SOLO:
+            self._enter_party_mode()
+        else:
+            self._leave_party_mode()
 
-    def _on_session_create_result(self, result: dict | None) -> None:
-        if result is None:
-            return
-        name = result["display_name"]
-        code = result["session_code"]
-        self._p2p_display_name = name
+    def _enter_party_mode(self) -> None:
+        """Start party mode: scan for groups, auto-join or host."""
+        self._party_state = PartyState.SCANNING
         self._ensure_p2p_identity()
-        # Cancel the auto-discovery worker BEFORE stopping discovery —
-        # prevents the worker from overwriting self._discovery after we nil it.
-        self.workers.cancel_group(self, "p2p_discovery")
-        self._stop_discovery()  # stop auto-discovery before session setup
+        self._update_telemetry()
 
-        tp = self.query_one(TranscriptPanel)
-        tp.system_message(f"P2P session starting...")
-        self._start_p2p_session(code, is_creator=True)
+        # Check peers already discovered by passive mDNS
+        groups = self._find_party_groups()
+        if len(groups) == 1:
+            # Auto-join the only group
+            self._party_state = PartyState.JOINING
+            self._update_telemetry()
+            group = groups[0]
+            self._join_party(group["session_code"], group["display_name"])
+        elif len(groups) == 0:
+            # No groups — you're the party now
+            self._host_party()
+        else:
+            # Multiple groups — auto-join the largest
+            groups.sort(key=lambda g: g["peer_count"], reverse=True)
+            self._party_state = PartyState.JOINING
+            self._update_telemetry()
+            group = groups[0]
+            self._join_party(group["session_code"], group["display_name"])
+
+    def _find_party_groups(self) -> list[dict]:
+        """Find active party groups from discovered peers."""
+        if not self._discovery:
+            return []
+        peers = self._discovery.get_visible_peers()
+        # Group by session_code — peers with the same code are in the same party
+        groups: dict[str, dict] = {}
+        for p in peers:
+            if not p.in_session or not p.session_code:
+                continue
+            if p.session_code not in groups:
+                groups[p.session_code] = {
+                    "session_code": p.session_code,
+                    "display_name": p.group_name or p.display_name,
+                    "peer_count": 1,
+                    "ip": p.ip,
+                    "tcp_port": p.tcp_port,
+                }
+            else:
+                groups[p.session_code]["peer_count"] += 1
+        return list(groups.values())
+
+    def _host_party(self) -> None:
+        """Create a new party — you're the host."""
+        code = generate_session_code()
+        self.workers.cancel_group(self, "p2p_discovery")
+        self._stop_discovery()
+        self._start_party_session(code, is_creator=True)
+
+    def _join_party(self, session_code: str, group_name: str) -> None:
+        """Join an existing party by session code (read from mDNS)."""
+        self.workers.cancel_group(self, "p2p_discovery")
+        self._stop_discovery()
+        self._start_party_session(session_code, is_creator=False)
 
     @work(thread=True, group="p2p_setup")
-    def _start_p2p_session(self, code: str, is_creator: bool) -> None:
+    def _start_party_session(self, code: str, is_creator: bool) -> None:
         """Start P2P session in a worker thread to avoid blocking the event loop."""
         try:
-            # Shut down any previous session manager that may be orphaned
-            # from a cancelled worker (thread=True workers can't be interrupted)
             old_mgr = self._session_mgr
             if old_mgr is not None:
                 try:
@@ -1779,7 +1823,6 @@ class VoxTerm(App):
                 self._peer_mixer = mixer
                 self._audio_send_seq = 0
 
-                # Wire audio frame reception into the mixer
                 def on_audio_frame(nid_bytes, seq, timestamp, pcm_bytes):
                     nid = nid_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
                     mixer.peer_frame(nid, seq, pcm_bytes)
@@ -1799,14 +1842,13 @@ class VoxTerm(App):
 
             if is_creator:
                 mgr.create_session()
-                # Override with the code from the UI (create_session generates its own)
                 mgr._session_code = code
                 mgr._session_key = derive_session_key(code)
             else:
                 mgr.join_session(code)
             port = mgr._server_sock.getsockname()[1]
 
-            # Start bounded sender thread for P2P broadcast (replaces per-call threads)
+            # Bounded sender thread for P2P broadcast
             self._p2p_send_queue = queue.Queue(maxsize=64)
             send_q = self._p2p_send_queue
 
@@ -1825,11 +1867,6 @@ class VoxTerm(App):
                 target=_p2p_sender_loop, daemon=True, name="p2p-sender"
             ).start()
 
-            # Wire discovery callback BEFORE starting so we don't miss peers.
-            # Only the node with the lower node_id initiates the TCP connection.
-            # The other side accepts via the accept loop. This prevents the
-            # dual-connect race where both sides connect simultaneously,
-            # clobber each other, and immediately disconnect.
             my_id = self._p2p_node_id
 
             def on_peer_found(peer_info):
@@ -1838,17 +1875,12 @@ class VoxTerm(App):
                 if mgr.has_peer(peer_info.node_id):
                     return
                 if not peer_info.in_session:
-                    self.call_from_thread(
-                        self._p2p_debug_msg,
-                        f"found {peer_info.display_name} (idle, not in session)"
-                    )
                     return
                 self.call_from_thread(
                     self._p2p_debug_msg,
-                    f"found {peer_info.display_name} in session — "
-                    + ("connecting..." if my_id < peer_info.node_id else "waiting for their connection...")
+                    f"found {peer_info.display_name} — "
+                    + ("connecting..." if my_id < peer_info.node_id else "waiting...")
                 )
-                # Tie-break: lower node_id initiates
                 if my_id < peer_info.node_id:
                     threading.Thread(
                         target=self._try_connect_peer,
@@ -1857,9 +1889,12 @@ class VoxTerm(App):
                     ).start()
 
             self._start_discovery(port, on_peer_found=on_peer_found)
-            self._discovery.update_session_status(True)
+            # Advertise our session code + group name via mDNS
+            self._discovery.update_group(
+                self._p2p_display_name, True, session_code=code,
+            )
 
-            # Connect to any already-visible peers (same tie-break)
+            # Connect to any already-visible peers
             for peer_info in self._discovery.get_visible_peers():
                 if (peer_info.in_session
                         and peer_info.node_id != my_id
@@ -1870,9 +1905,7 @@ class VoxTerm(App):
                         daemon=True,
                     ).start()
 
-            # Fallback: if no peers connect within 3 seconds, try connecting
-            # to all visible peers regardless of tie-break (in case mDNS
-            # discovery was one-directional)
+            # Fallback retry after 3 seconds
             def _retry_connect():
                 import time as _time
                 _time.sleep(3.0)
@@ -1883,10 +1916,6 @@ class VoxTerm(App):
                 if has_peers:
                     return
                 visible = self._discovery.get_visible_peers() if self._discovery else []
-                self.call_from_thread(
-                    self._p2p_debug_msg,
-                    f"no peers after 3s, retrying... ({len(visible)} visible on network)"
-                )
                 for pi in visible:
                     if pi.in_session and pi.node_id != my_id:
                         with mgr._lock:
@@ -1896,20 +1925,10 @@ class VoxTerm(App):
 
             threading.Thread(target=_retry_connect, daemon=True).start()
 
-            if is_creator:
-                self.call_from_thread(
-                    self._p2p_session_ready,
-                    f"code: {code}  — tell others to press J and enter this",
-                )
-            else:
-                self.call_from_thread(
-                    self._p2p_session_ready,
-                    f"joining session: {code} — scanning network...",
-                )
+            # Update state — we're in the party
+            self.call_from_thread(self._party_ready, is_creator)
 
         except Exception as exc:
-            # Clean up the half-initialized session manager so the user
-            # isn't stuck in "already in a session" state forever.
             self._stop_audio_merge()
             try:
                 if self._session_mgr is not None:
@@ -1917,44 +1936,44 @@ class VoxTerm(App):
             except Exception:
                 pass
             self._session_mgr = None
-            self.call_from_thread(
-                self.query_one(TranscriptPanel).system_message,
-                f"P2P session failed: {exc}",
-            )
+            self.call_from_thread(self._party_failed, str(exc))
 
-    def _p2p_session_ready(self, status_msg: str) -> None:
-        """Called on main thread when P2P session is ready."""
-        tp = self.query_one(TranscriptPanel)
-        tp.system_message("P2P session active")
-        tp.system_message(status_msg)
+    def _party_ready(self, is_host: bool) -> None:
+        """Called on main thread when party session is ready."""
+        self._party_state = PartyState.IN_PARTY
+        if is_host:
+            self.query_one(TranscriptPanel).system_message(
+                "you're the party now — waiting for others"
+            )
+        else:
+            self.query_one(TranscriptPanel).system_message(
+                "joined the party"
+            )
         self._update_telemetry()
 
-    def action_join_session(self):
-        if not _P2P_AVAILABLE:
-            self.query_one(TranscriptPanel).system_message(
-                "P2P unavailable — install zeroconf and cryptography"
-            )
-            return
-        if self._session_mgr and self._session_mgr.is_in_session:
-            self.query_one(TranscriptPanel).system_message("already in a session")
-            return
-        self.push_screen(SessionJoinScreen(), self._on_session_join_result)
+    def _party_failed(self, error: str) -> None:
+        """Called on main thread when party session fails."""
+        self._party_state = PartyState.SOLO
+        self.query_one(TranscriptPanel).system_message(f"party failed: {error}")
+        # Restart passive discovery
+        self._start_peer_discovery()
+        self._update_telemetry()
 
-    def _on_session_join_result(self, result: dict | None) -> None:
-        if result is None:
-            return
-        name = result["display_name"]
-        code = result["session_code"]
-        self._p2p_display_name = name
-        self._ensure_p2p_identity()
-        # Cancel the auto-discovery worker BEFORE stopping discovery —
-        # prevents the worker from overwriting self._discovery after we nil it.
-        self.workers.cancel_group(self, "p2p_discovery")
-        self._stop_discovery()  # stop auto-discovery before session setup
-
-        tp = self.query_one(TranscriptPanel)
-        tp.system_message(f"joining session...")
-        self._start_p2p_session(code, is_creator=False)
+    def _leave_party_mode(self) -> None:
+        """Leave the party and return to solo mode."""
+        self._stop_audio_merge()
+        if self._session_mgr:
+            try:
+                self._session_mgr.leave_session()
+            except Exception:
+                pass
+            self._session_mgr = None
+        self._p2p_send_queue = None
+        self._party_state = PartyState.SOLO
+        self.query_one(TranscriptPanel).system_message("left the party")
+        # Restart passive discovery
+        self._start_peer_discovery()
+        self._update_telemetry()
 
     def _try_connect_peer(self, peer_info) -> None:
         """Try connecting to a discovered peer (runs in background thread)."""

@@ -38,6 +38,7 @@ class PeerInfo:
     udp_port: int
     in_session: bool
     group_name: str = ""
+    session_code: str = ""
     proto_v: int = 1
 
 
@@ -67,6 +68,7 @@ class PeerDiscovery:
         self._udp_port = udp_port
         self._in_session = False
         self._group_name = ""
+        self._session_code = ""
 
         self._zeroconf: Zeroconf | None = None
         self._browser: ServiceBrowser | None = None
@@ -104,10 +106,11 @@ class PeerDiscovery:
             self._zeroconf = None
         log.info("mDNS stopped")
 
-    def update_group(self, group_name: str, in_session: bool) -> None:
+    def update_group(self, group_name: str, in_session: bool, session_code: str = "") -> None:
         """Update mDNS TXT record with group name and session status."""
         self._group_name = group_name
         self._in_session = in_session
+        self._session_code = session_code
         if self._zeroconf and self._service_info:
             new_info = self._build_service_info()
             try:
@@ -158,6 +161,7 @@ class PeerDiscovery:
                 "node_id": self._node_id,
                 "display_name": self._display_name,
                 "group_name": self._group_name,
+                "session_code": self._session_code,
                 "in_session": "1" if self._in_session else "0",
                 "proto_v": "1",
                 "tcp_port": str(self._tcp_port),
@@ -236,6 +240,7 @@ class PeerDiscovery:
                 udp_port=int(props.get(b"udp_port", b"0").decode()),
                 in_session=props.get(b"in_session", b"0") == b"1",
                 group_name=(props.get(b"group_name") or b"").decode("utf-8", errors="replace"),
+                session_code=(props.get(b"session_code") or b"").decode("utf-8", errors="replace"),
                 proto_v=int(props.get(b"proto_v", b"1").decode()),
             )
         except (KeyError, ValueError, IndexError) as exc:
