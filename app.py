@@ -107,7 +107,8 @@ PARTY_COLORS = [
 
 def _party_color(session_code: str) -> tuple[str, str]:
     """Derive a (primary, light) color pair from the session code."""
-    h = hash(session_code) % len(PARTY_COLORS)
+    import hashlib
+    h = int(hashlib.sha256(session_code.encode()).hexdigest(), 16) % len(PARTY_COLORS)
     return PARTY_COLORS[h]
 
 
