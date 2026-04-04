@@ -1218,6 +1218,16 @@ class VoxTerm(App):
         """Start model loading in a plain thread (not @work — avoids fd inheritance bugs)."""
         def _do_load():
             try:
+                # Python 3.12 subprocess fails with "bad value(s) in fds_to_keep"
+                # when spawned from a thread while Textual holds terminal FDs.
+                # Close all non-standard FDs in this thread before loading.
+                import subprocess
+                _orig_popen = subprocess.Popen
+                def _safe_popen(*args, **kwargs):
+                    kwargs.setdefault('close_fds', False)
+                    return _orig_popen(*args, **kwargs)
+                subprocess.Popen = _safe_popen
+
                 model_repo = AVAILABLE_MODELS[self._model_name]
                 if self._model_name in QWEN3_MODELS:
                     self.transcriber = Qwen3Transcriber(model=model_repo, language=self._language)
