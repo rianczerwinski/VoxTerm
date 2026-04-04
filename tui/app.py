@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Internal runtime defaults — prevent known framework conflicts
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -43,17 +43,17 @@ from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual import work
 
-from widgets.header import CyberHeader
-from widgets.waveform import WaveformWidget, _make_style
-from widgets.transcript import TranscriptPanel
-from widgets.tag_screen import SpeakerTagScreen
-from widgets.profile_screen import SpeakerProfileScreen
+from tui.widgets.header import CyberHeader
+from tui.widgets.waveform import WaveformWidget, _make_style
+from tui.widgets.transcript import TranscriptPanel
+from tui.widgets.tag_screen import SpeakerTagScreen
+from tui.widgets.profile_screen import SpeakerProfileScreen
 from audio.capture import AudioCapture
 from audio.buffer import AudioBuffer
 from audio.system_capture import SystemCapture
-from transcriber.engine import Qwen3Transcriber, WhisperTranscriber, FasterWhisperTranscriber
-from diarization.proxy import DiarizationProxy
-from speakers.store import SpeakerStore
+from audio.transcriber import Qwen3Transcriber, WhisperTranscriber, FasterWhisperTranscriber
+from audio.diarization.proxy import DiarizationProxy
+from audio.speakers.store import SpeakerStore
 from audio.vad import SileroVAD
 from config import (
     SAMPLE_RATE, CHUNK_SIZE, WAVEFORM_FPS,
@@ -79,7 +79,7 @@ def _clipboard_cmd() -> list[str] | None:
     return None
 
 
-from party.manager import PartyManager, PartyState, P2P_AVAILABLE as _P2P_AVAILABLE
+from network.party import PartyManager, PartyState, P2P_AVAILABLE as _P2P_AVAILABLE
 
 from config_store import ConfigStore
 

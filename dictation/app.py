@@ -88,7 +88,7 @@ def _check_linux_tools() -> bool:
 
 def _load_transcriber(model_name: str, model_repo: str, language: str):
     """Load the transcription model (same logic as app.py __main__)."""
-    from transcriber.engine import (
+    from audio.transcriber import (
         FasterWhisperTranscriber,
         Qwen3Transcriber,
         WhisperTranscriber,
