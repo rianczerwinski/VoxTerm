@@ -1790,17 +1790,16 @@ class VoxTerm(App):
         except Exception:
             pass
 
-        # Let Textual restore the terminal, then hard-exit.
-        # All cleanup (P2P disconnect, audio stop, mDNS unregister) is
-        # skipped — os._exit kills all threads and the OS reclaims
-        # sockets, file handles, and shared memory instantly.
-        def _silent_exit():
-            try:
-                sys.stderr.close()
-            except Exception:
-                pass
+        # Suppress stderr before exit to prevent leaked semaphore warnings
+        # from multiprocessing.resource_tracker during shutdown.
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+        # Hard-exit after Textual restores the terminal.
+        def _hard_exit():
             os._exit(0)
-        threading.Timer(0.3, _silent_exit).start()
+        threading.Timer(0.5, _hard_exit).start()
         self.exit()
 
 
