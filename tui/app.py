@@ -616,7 +616,6 @@ class VoxTerm(App):
             self._load_diarizer()
         else:
             self.query_one(TranscriptPanel).system_message(f"loading model: {self._model_name}...")
-            self.query_one(TranscriptPanel).system_message("first run downloads the model, please wait")
             self._start_audio_timer()
             self._load_model()
 
@@ -1215,23 +1214,25 @@ class VoxTerm(App):
         except Exception:
             pass  # never block transcription on I/O failure
 
-    @work(thread=True, group="model_loading")
     def _load_model(self):
-        try:
-            model_repo = AVAILABLE_MODELS[self._model_name]
-            if self._model_name in QWEN3_MODELS:
-                self.transcriber = Qwen3Transcriber(model=model_repo, language=self._language)
-            elif self._model_name in FASTER_WHISPER_MODELS:
-                self.transcriber = FasterWhisperTranscriber(model=model_repo, language=self._language)
-            else:
-                self.transcriber = WhisperTranscriber(model=model_repo)
-            self.transcriber.load()
-            self.call_from_thread(self._on_model_loaded)
-        except Exception as e:
-            self.call_from_thread(
-                self.query_one(TranscriptPanel).system_message,
-                f"model load failed: {e}"
-            )
+        """Start model loading in a plain thread (not @work — avoids fd inheritance bugs)."""
+        def _do_load():
+            try:
+                model_repo = AVAILABLE_MODELS[self._model_name]
+                if self._model_name in QWEN3_MODELS:
+                    self.transcriber = Qwen3Transcriber(model=model_repo, language=self._language)
+                elif self._model_name in FASTER_WHISPER_MODELS:
+                    self.transcriber = FasterWhisperTranscriber(model=model_repo, language=self._language)
+                else:
+                    self.transcriber = WhisperTranscriber(model=model_repo)
+                self.transcriber.load()
+                self.call_from_thread(self._on_model_loaded)
+            except Exception as e:
+                self.call_from_thread(
+                    self.query_one(TranscriptPanel).system_message,
+                    f"model load failed: {e}"
+                )
+        threading.Thread(target=_do_load, daemon=True, name="model-loader").start()
 
     def _on_model_loaded(self):
         self._model_loaded = True
