@@ -194,6 +194,10 @@ class PartyManager:
         return self._state == PartyState.IN_PARTY
 
     @property
+    def is_host(self) -> bool:
+        return getattr(self, "_is_host", False)
+
+    @property
     def is_available(self) -> bool:
         return P2P_AVAILABLE
 
@@ -532,6 +536,7 @@ class PartyManager:
     def _party_ready(self, is_host: bool) -> None:
         """Called on main thread when party session is ready."""
         self._state = PartyState.IN_PARTY
+        self._is_host = is_host
         self._fire_state_changed()
         if self.on_party_color_changed:
             self.on_party_color_changed(self._color_pri, self._color_light)
@@ -773,7 +778,7 @@ class PartyManager:
                 text = f"    {names}  [{pc}]●[/] you"
             else:
                 text = f"    [{pc}]●[/] you"
-            text += "    [dim]\\[N][/]"
+            text += "    [dim]Leave Party \\[N][/]"
             return text
         elif self._discovery:
             visible = len(self._discovery.get_visible_peers())

@@ -512,7 +512,12 @@ class VoxTerm(App):
             prev = _prev_state[0]
             _prev_state[0] = state
             if state == PartyState.IN_PARTY and prev != PartyState.IN_PARTY:
-                self.query_one(TranscriptPanel).system_message("joined the party")
+                if self._party_mgr and self._party_mgr.is_host:
+                    self.query_one(TranscriptPanel).system_message(
+                        "no party found, you are the party now"
+                    )
+                else:
+                    self.query_one(TranscriptPanel).system_message("joined the party")
             self._update_telemetry()
 
         def _on_peer_joined(display_name):
@@ -613,9 +618,9 @@ class VoxTerm(App):
     def _update_telemetry(self):
         # Status dot
         if self._recording:
-            status = "[bold #00ff88]● REC[/]"
+            status = "[bold #00ff88]● REC[/] [dim]\\[R][/]"
         elif self._model_loaded:
-            status = "[bold #607080]● IDLE[/]"
+            status = "[bold #607080]● IDLE[/] [dim]\\[R][/]"
         else:
             status = "[bold #607080]● LOADING[/]"
 
@@ -650,7 +655,7 @@ class VoxTerm(App):
         self.query_one("#telemetry", Static).update(
             f"  {status}"
             f"    [#00ffcc]{model_text}[/] [dim]\\[M][/]"
-            f"    [#ffaa66]{lang_text}[/]"
+            f"    [#ffaa66]{lang_text}[/] [dim]\\[L][/]"
             f"{spk_text}"
             f"{p2p_text}"
             f"{saved_text}"
