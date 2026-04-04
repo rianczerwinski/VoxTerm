@@ -14,9 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Only needed when running as a script, not when installed as a package
-if __package__ is None:
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Internal runtime defaults — prevent known framework conflicts
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1807,8 +1805,7 @@ class VoxTerm(App):
 
 
 
-def main():
-    """Entry point for the ``voxterm`` console script (pipx / pip install)."""
+if __name__ == "__main__":
     import argparse
 
     # Resolve defaults: saved preferences > config defaults
@@ -1936,7 +1933,3 @@ def main():
         except Exception:
             pass
         os._exit(0)
-
-
-if __name__ == "__main__":
-    main()
