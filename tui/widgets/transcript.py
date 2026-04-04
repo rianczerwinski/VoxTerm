@@ -32,10 +32,10 @@ _LOG_CATEGORIES = {
 
 _TIMESTAMP_COLOR = "#306070"
 
-# Rainbow palette for special highlights (cyberpunk neon)
+# Rainbow palette for special highlights (dim cyberpunk)
 _RAINBOW = [
-    "#ff0055", "#ff6600", "#ffcc00", "#00ff88",
-    "#00ccff", "#aa66ff", "#ff44aa",
+    "#993344", "#996644", "#998844", "#449966",
+    "#448899", "#775599", "#993366",
 ]
 
 
