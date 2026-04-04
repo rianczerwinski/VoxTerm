@@ -33,16 +33,14 @@ diagnostics.rotate_crash_logs()
 import warnings
 warnings.filterwarnings("ignore", message="resource_tracker", category=UserWarning)
 
-# Disable the multiprocessing resource tracker subprocess entirely.
+# Neuter the multiprocessing resource tracker subprocess.
 # It prints leaked-semaphore warnings to its own stderr on shutdown,
 # which we can't suppress from the main process. Since we use os._exit(),
 # the OS reclaims all shared resources — the tracker is unnecessary.
+# We let it spawn (libraries need register/unregister to function) but
+# prevent it from printing warnings on stop.
 import multiprocessing.resource_tracker as _rt
-_rt._resource_tracker._stop = lambda: None  # prevent tracker from printing warnings
-try:
-    _rt.getfd = lambda: None  # prevent tracker from spawning
-except Exception:
-    pass
+_rt._resource_tracker._stop = lambda: None
 
 from enum import Enum
 import numpy as np
@@ -1220,27 +1218,31 @@ class VoxTerm(App):
             try:
                 # Python 3.12 subprocess/multiprocessing fails with
                 # "bad value(s) in fds_to_keep" when spawned from a thread
-                # while Textual holds terminal FDs open. Patch both.
-                import subprocess, multiprocessing
-                for mod in [subprocess, multiprocessing]:
-                    if hasattr(mod, 'Popen'):
-                        _orig = mod.Popen.__init__
-                        def _make_patch(orig):
-                            def _patched(self_p, *args, **kwargs):
-                                try:
-                                    orig(self_p, *args, **kwargs)
-                                except ValueError:
-                                    kwargs['close_fds'] = False
-                                    orig(self_p, *args, **kwargs)
-                            return _patched
-                        mod.Popen.__init__ = _make_patch(_orig)
-
-                # Also set multiprocessing start method to 'spawn' to avoid
-                # forking with Textual's FDs
-                try:
-                    multiprocessing.set_start_method('spawn', force=True)
-                except RuntimeError:
-                    pass
+                # while Textual holds terminal FDs open.
+                #
+                # The previous patch on subprocess.Popen.__init__ didn't help
+                # because multiprocessing.util.spawnv_passfds calls
+                # _posixsubprocess.fork_exec directly, bypassing Popen.
+                # Patch at the C-level entry point to sanitize fds_to_keep.
+                import _posixsubprocess
+                if not getattr(_posixsubprocess, '_vt_patched', False):
+                    _orig_fe = _posixsubprocess.fork_exec
+                    def _safe_fork_exec(*args):
+                        largs = list(args)
+                        fds = largs[3]  # fds_to_keep (sorted tuple of ints)
+                        if fds:
+                            clean = tuple(
+                                fd for fd in fds
+                                if isinstance(fd, int) and 0 <= fd <= 2**31
+                            )
+                            largs[3] = clean
+                        try:
+                            return _orig_fe(*largs)
+                        except ValueError:
+                            largs[3] = ()
+                            return _orig_fe(*largs)
+                    _posixsubprocess.fork_exec = _safe_fork_exec
+                    _posixsubprocess._vt_patched = True
 
                 model_repo = AVAILABLE_MODELS[self._model_name]
                 if self._model_name in QWEN3_MODELS:
@@ -1832,8 +1834,16 @@ class VoxTerm(App):
         except Exception:
             pass
 
-        # Suppress stderr before exit to prevent leaked semaphore warnings
-        # from multiprocessing.resource_tracker during shutdown.
+        # Kill the resource tracker process if it somehow spawned —
+        # prevents leaked-semaphore warning printed to terminal after exit.
+        try:
+            import multiprocessing.resource_tracker as _rt
+            pid = getattr(_rt._resource_tracker, '_pid', None)
+            if pid:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
         try:
             sys.stderr.close()
         except Exception:
