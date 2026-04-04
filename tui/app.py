@@ -1218,18 +1218,29 @@ class VoxTerm(App):
         """Start model loading in a plain thread (not @work — avoids fd inheritance bugs)."""
         def _do_load():
             try:
-                # Python 3.12 subprocess fails with "bad value(s) in fds_to_keep"
-                # when spawned from a thread while Textual holds terminal FDs.
-                # Monkeypatch _execute_child to catch and retry with close_fds=False.
-                import subprocess
-                _orig = subprocess.Popen.__init__
-                def _patched_init(self_p, *args, **kwargs):
-                    try:
-                        _orig(self_p, *args, **kwargs)
-                    except ValueError:
-                        kwargs['close_fds'] = False
-                        _orig(self_p, *args, **kwargs)
-                subprocess.Popen.__init__ = _patched_init
+                # Python 3.12 subprocess/multiprocessing fails with
+                # "bad value(s) in fds_to_keep" when spawned from a thread
+                # while Textual holds terminal FDs open. Patch both.
+                import subprocess, multiprocessing
+                for mod in [subprocess, multiprocessing]:
+                    if hasattr(mod, 'Popen'):
+                        _orig = mod.Popen.__init__
+                        def _make_patch(orig):
+                            def _patched(self_p, *args, **kwargs):
+                                try:
+                                    orig(self_p, *args, **kwargs)
+                                except ValueError:
+                                    kwargs['close_fds'] = False
+                                    orig(self_p, *args, **kwargs)
+                            return _patched
+                        mod.Popen.__init__ = _make_patch(_orig)
+
+                # Also set multiprocessing start method to 'spawn' to avoid
+                # forking with Textual's FDs
+                try:
+                    multiprocessing.set_start_method('spawn', force=True)
+                except RuntimeError:
+                    pass
 
                 model_repo = AVAILABLE_MODELS[self._model_name]
                 if self._model_name in QWEN3_MODELS:
@@ -1241,6 +1252,8 @@ class VoxTerm(App):
                 self.transcriber.load()
                 self.call_from_thread(self._on_model_loaded)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 self.call_from_thread(
                     self.query_one(TranscriptPanel).system_message,
                     f"model load failed: {e}"
