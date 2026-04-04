@@ -543,7 +543,17 @@ class PartyManager:
             self.on_party_color_changed(self._color_pri, self._color_light)
 
     def _handle_party_failed(self, error: str) -> None:
-        """Called on main thread when party session fails."""
+        """Called on main thread when party session fails.
+
+        If we failed trying to JOIN (likely stale mDNS entry), fall back
+        to hosting instead of giving up.
+        """
+        if not self._is_host and self._state != PartyState.SOLO:
+            # Tried to join a ghost party — host our own instead
+            if self.on_debug:
+                self.on_debug(f"join failed ({error}), hosting instead")
+            self._host_party()
+            return
         self._state = PartyState.SOLO
         if self.on_party_failed:
             self.on_party_failed(error)
