@@ -40,6 +40,7 @@ class PeerInfo:
     group_name: str = ""
     session_code: str = ""
     party_color: str = ""
+    app_version: str = ""
     proto_v: int = 1
 
 
@@ -71,6 +72,9 @@ class PeerDiscovery:
         self._group_name = ""
         self._session_code = ""
         self._party_color = ""
+        # Import version at init time to avoid circular imports in mDNS callbacks
+        from config import VERSION
+        self._app_version = VERSION
 
         self._zeroconf: Zeroconf | None = None
         self._browser: ServiceBrowser | None = None
@@ -166,6 +170,7 @@ class PeerDiscovery:
                 "group_name": self._group_name,
                 "session_code": self._session_code,
                 "party_color": self._party_color,
+                "app_version": self._app_version,
                 "in_session": "1" if self._in_session else "0",
                 "proto_v": "1",
                 "tcp_port": str(self._tcp_port),
@@ -246,6 +251,7 @@ class PeerDiscovery:
                 group_name=(props.get(b"group_name") or b"").decode("utf-8", errors="replace"),
                 session_code=(props.get(b"session_code") or b"").decode("utf-8", errors="replace"),
                 party_color=(props.get(b"party_color") or b"").decode("utf-8", errors="replace"),
+                app_version=(props.get(b"app_version") or b"").decode("utf-8", errors="replace"),
                 proto_v=int(props.get(b"proto_v", b"1").decode()),
             )
         except (KeyError, ValueError, IndexError) as exc:
