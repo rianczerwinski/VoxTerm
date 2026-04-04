@@ -35,5 +35,10 @@ tests/fixtures/speakers/tst01.wav
 # Generated media
 docs/pipeline.mp4
 
+# Packaging artifacts
+*.egg-info/
+dist/
+build/
+
 # Nix
 result
