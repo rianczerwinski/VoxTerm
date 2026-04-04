@@ -57,6 +57,7 @@ from tui.widgets.waveform import WaveformWidget, _make_style
 from tui.widgets.transcript import TranscriptPanel, Log
 from tui.widgets.tag_screen import SpeakerTagScreen
 from tui.widgets.profile_screen import SpeakerProfileScreen
+from tui.widgets.transcript_explorer import TranscriptExplorerScreen
 from audio.capture import AudioCapture
 from audio.buffer import AudioBuffer
 from audio.system_capture import SystemCapture
@@ -439,6 +440,7 @@ class VoxTerm(App):
         Binding("s", "export_transcript", "Export"),
         Binding("d", "toggle_debug", "Debug"),
         Binding("c", "clear_transcript", "Clear"),
+        Binding("e", "explore_transcripts", "History"),
         Binding("n", "toggle_party", "Party"),
         Binding("v", "toggle_merged_view", "View"),
         Binding("?", "show_help", "Help", key_display="?"),
@@ -1572,6 +1574,21 @@ class VoxTerm(App):
                 )
 
         self.push_screen(SpeakerProfileScreen(profiles), on_profile_result)
+
+    def action_explore_transcripts(self):
+        """Open transcript explorer to browse and copy saved transcripts."""
+        def on_result(result):
+            if result is None:
+                return
+            transcript = self.query_one(TranscriptPanel)
+            if "error" in result:
+                transcript.system_message(result["error"], Log.SYS)
+            elif "copied" in result:
+                transcript.system_message(
+                    f"copied transcript {result['copied']} to clipboard", Log.SYS
+                )
+
+        self.push_screen(TranscriptExplorerScreen(SESSIONS_DIR), on_result)
 
     def _swap_model(self, model_key: str):
         self._model_loaded = False
