@@ -1,5 +1,7 @@
 # VOXTERM Configuration
 
+VERSION = "0.0.0"
+
 import sys
 
 # Audio

@@ -49,7 +49,8 @@ class CyberHeader(Widget):
         else:
             line = Text()
             line.append("  +++ ", Style(color="#00e5ff", bold=True))
-            line.append("VOXTERM v1.0", Style(color="#00ffcc", bold=True))
+            from config import VERSION
+            line.append(f"VOXTERM v{VERSION}", Style(color="#00ffcc", bold=True))
             line.append(" // ", Style(color="#607080"))
             line.append("LOCAL VOICE TRANSCRIPTION ENGINE", Style(color="#00e5ff", bold=True))
             line.pad(width)
