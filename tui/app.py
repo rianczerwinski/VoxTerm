@@ -57,6 +57,7 @@ from tui.widgets.waveform import WaveformWidget, _make_style
 from tui.widgets.transcript import TranscriptPanel, Log
 from tui.widgets.tag_screen import SpeakerTagScreen
 from tui.widgets.profile_screen import SpeakerProfileScreen
+from tui.widgets.transcript_explorer import TranscriptExplorerScreen
 from audio.capture import AudioCapture
 from audio.buffer import AudioBuffer
 from audio.system_capture import SystemCapture
@@ -343,12 +344,12 @@ class HelpScreen(ModalScreen):
             yield Static(
                 "[bold #00e5ff]R[/]       [#c0c0c0]Start / stop recording[/]\n"
                 "[bold #00e5ff]T[/]       [#c0c0c0]Tag / name speakers[/]\n"
-                "[bold #00e5ff]P[/]       [#c0c0c0]Speaker profiles[/]\n"
-                "[bold #00e5ff]Ctrl+S[/]  [#c0c0c0]Save / copy transcript[/]\n"
+                "[bold #00e5ff]E[/]       [#c0c0c0]Browse saved transcripts[/]\n"
                 "[bold #00e5ff]S[/]       [#c0c0c0]Save / copy transcript[/]\n"
                 "[bold #00e5ff]M[/]       [#c0c0c0]Switch transcription model[/]\n"
                 "[bold #00e5ff]L[/]       [#c0c0c0]Switch language[/]\n"
-                "[bold #00e5ff]N[/]       [#c0c0c0]Party mode — join / leave[/]\n"
+                "[bold #00e5ff]P[/]       [#c0c0c0]Party mode — join / leave[/]\n"
+                "[bold #00e5ff]O[/]       [#c0c0c0]Speaker profiles[/]\n"
                 "[bold #00e5ff]V[/]       [#c0c0c0]Toggle merged transcript view[/]\n"
                 "[bold #00e5ff]C[/]       [#c0c0c0]Clear transcript[/]\n"
                 "[bold #00e5ff]D[/]       [#c0c0c0]Toggle debug mode[/]\n"
@@ -432,14 +433,15 @@ class VoxTerm(App):
     BINDINGS = [
         Binding("r", "toggle_recording", "Record/Pause"),
         Binding("t", "tag_speakers", "Tag"),
-        Binding("p", "manage_profiles", "Profiles"),
+        Binding("o", "manage_profiles", "Profiles", show=False),
         Binding("m", "switch_model", "Model"),
         Binding("l", "switch_language", "Language"),
         Binding("ctrl+s", "export_transcript", "Save"),
         Binding("s", "export_transcript", "Export"),
         Binding("d", "toggle_debug", "Debug"),
         Binding("c", "clear_transcript", "Clear"),
-        Binding("n", "toggle_party", "Party"),
+        Binding("e", "explore_transcripts", "History"),
+        Binding("p", "toggle_party", "Party"),
         Binding("v", "toggle_merged_view", "View"),
         Binding("?", "show_help", "Help", key_display="?"),
         Binding("q", "quit", "Quit"),
@@ -503,8 +505,8 @@ class VoxTerm(App):
         yield Static(
             " [bold #00e5ff]\\[R][/][#607080] Record  [/]"
             "[bold #00e5ff]\\[T][/][#607080] Tag  [/]"
-            "[bold #00e5ff]\\[P][/][#607080] Profiles  [/]"
-            "[bold #00e5ff]\\[N][/][#607080] Session  [/]"
+            "[bold #00e5ff]\\[E][/][#607080] Transcripts  [/]"
+            "[bold #00e5ff]\\[P][/][#607080] Party  [/]"
             "[bold #00e5ff]\\[V][/][#607080] Merged  [/]"
             "[bold #00e5ff]\\[?][/][#607080] Help[/]",
             id="footer-bar",
@@ -639,16 +641,6 @@ class VoxTerm(App):
         model_text = self._model_name if self._model_loaded else "loading..."
         lang_text = AVAILABLE_LANGUAGES.get(self._language, self._language) if self._language else "auto"
 
-        spk_count = self.diarizer.num_speakers if self._diarizer_loaded else 0
-        if spk_count > 0:
-            tagged_count = len(self.diarizer.get_speaker_names())
-            if tagged_count > 0:
-                spk_text = f"    [#aa88ff]{tagged_count}/{spk_count} tagged[/]"
-            else:
-                spk_text = f"    [#aa88ff]{spk_count} speakers[/]"
-        else:
-            spk_text = ""
-
         # Party mode indicator (delegated to PartyManager)
         p2p_text = self._party.telemetry_text()
 
@@ -656,9 +648,8 @@ class VoxTerm(App):
             f"  {status}"
             f"    [#00ffcc]{model_text}[/] [dim]\\[M][/]"
             f"    [#ffaa66]{lang_text}[/] [dim]\\[L][/]"
-            f"{spk_text}"
             f"{p2p_text}"
-            f"    [dim]\\[S] Save  \\[Q] Quit[/]"
+            f"    [dim]\\[E] Transcripts  \\[S] Save  \\[Q] Quit[/]"
         )
 
         # Auto-save indicator in transcript border title
@@ -1575,6 +1566,21 @@ class VoxTerm(App):
                 )
 
         self.push_screen(SpeakerProfileScreen(profiles), on_profile_result)
+
+    def action_explore_transcripts(self):
+        """Open transcript explorer to browse and copy saved transcripts."""
+        def on_result(result):
+            if result is None:
+                return
+            transcript = self.query_one(TranscriptPanel)
+            if "error" in result:
+                transcript.system_message(result["error"], Log.SYS)
+            elif "copied" in result:
+                transcript.system_message(
+                    f"copied transcript {result['copied']} to clipboard", Log.SYS
+                )
+
+        self.push_screen(TranscriptExplorerScreen(SESSIONS_DIR), on_result)
 
     def _swap_model(self, model_key: str):
         self._model_loaded = False
