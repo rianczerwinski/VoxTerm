@@ -11,7 +11,7 @@ VoxTerm is **local first and private by default**. Everything runs on your machi
 
 - **No audio is stored.** Microphone input is processed in real-time and discarded. Only text transcripts are saved.
 - **Voice profiles are encrypted at rest.** Speaker embeddings (biometric data used to recognize voices across sessions) are encrypted with AES-256-CBC. The key lives in your macOS Keychain — zero config.
-- **Transcripts are yours.** Auto-saved as markdown to `~/Documents/voxterm/`. Never uploaded anywhere.
+- **Transcripts are yours.** Auto-saved as markdown to `~/Documents/voxterm-transcripts/`. Never uploaded anywhere.
 - **P2P stays on your LAN.** Party mode shares transcripts over your local network only. No relay servers.
 - **Delete everything anytime.** Press `P` → delete to permanently wipe all voice data from disk.
 

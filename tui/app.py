@@ -1194,16 +1194,19 @@ class VoxTerm(App):
         try:
             LIVE_DIR.mkdir(parents=True, exist_ok=True)
             if self._live_file is None:
-                fname = self._session_start.strftime("%Y-%m-%d_%H%M%S") + ".md"
+                fname = self._session_start.strftime("%Y-%m-%d_%H%M%S") + "-transcript.md"
                 self._live_file = LIVE_DIR / fname
                 self._live_header_written = False
 
             with open(self._live_file, "a", encoding="utf-8") as f:
                 if not self._live_header_written:
-                    f.write(f"# VOXTERM Transcript\n\n")
-                    f.write(f"- **Date:** {self._session_start.strftime('%Y-%m-%d')}\n")
-                    f.write(f"- **Time:** {self._session_start.strftime('%H:%M:%S')}\n")
-                    f.write(f"- **Model:** {self._model_name}\n\n---\n\n")
+                    lang = AVAILABLE_LANGUAGES.get(self._language, self._language) if self._language else "auto"
+                    f.write(f"# VoxTerm Transcript\n\n")
+                    f.write(f"- **Date:** {self._session_start.strftime('%A, %B %d, %Y')}\n")
+                    f.write(f"- **Started:** {self._session_start.strftime('%I:%M %p')}\n")
+                    f.write(f"- **Model:** {self._model_name}\n")
+                    f.write(f"- **Language:** {lang}\n")
+                    f.write(f"\n---\n\n")
                     self._live_header_written = True
 
                 ts = datetime.now().strftime("%H:%M:%S")
@@ -1638,7 +1641,7 @@ class VoxTerm(App):
         """Promote live file to final transcript."""
         transcript = self.query_one(TranscriptPanel)
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        filename = self._session_start.strftime("%Y-%m-%d_%H%M%S") + ".md"
+        filename = self._session_start.strftime("%Y-%m-%d_%H%M%S") + "-transcript.md"
         filepath = SESSIONS_DIR / filename
 
         # Write the full markdown (cleaner than the append-mode live file)
