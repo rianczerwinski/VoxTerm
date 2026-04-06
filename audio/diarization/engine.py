@@ -844,10 +844,10 @@ class DiarizationEngine:
             duration_sec = (end_sample - start_sample) / sample_rate
             if sid not in self._segment_embeddings:
                 self._segment_embeddings[sid] = []
-            self._segment_embeddings[sid].append((emb.copy(), duration_sec))
+            self._segment_embeddings[sid].append((ld["embedding"].copy(), duration_sec))
             if len(self._segment_embeddings[sid]) > self.MAX_EMBEDDINGS_PER_SPEAKER:
                 self._segment_embeddings[sid] = self._segment_embeddings[sid][-self.MAX_EMBEDDINGS_PER_SPEAKER:]
-            self._segment_order.append((sid, emb.copy()))
+            self._segment_order.append((sid, ld["embedding"].copy()))
         # Cap segment order after processing all local speakers
         if len(self._segment_order) > self.MAX_SEGMENT_ORDER:
             self._segment_order = self._segment_order[-self.MAX_SEGMENT_ORDER:]
@@ -944,6 +944,10 @@ class DiarizationEngine:
         if target_id not in self._segment_embeddings:
             self._segment_embeddings[target_id] = []
         self._segment_embeddings[target_id].extend(source_embs)
+        if len(self._segment_embeddings[target_id]) > self.MAX_EMBEDDINGS_PER_SPEAKER:
+            self._segment_embeddings[target_id] = self._segment_embeddings[target_id][
+                -self.MAX_EMBEDDINGS_PER_SPEAKER:
+            ]
 
         # Merge centroids: weighted average by segment count, re-normalize
         target_c = self._speaker_centroids.get(target_id)
